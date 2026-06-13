@@ -142,6 +142,15 @@ Engram is local-first: local SQLite is authoritative; cloud features are optiona
   - `200` when deleted
   - `404` when observation does not exist
 
+### Review
+
+- `GET /review` — List observations due for local review. Query: `?project=X&limit=N`
+- `POST /review/mark_reviewed` — Reset one observation's local review cycle. Body: `{observation_id}`; legacy `{id}` is accepted.
+  - `200` with the refreshed observation payload when marked reviewed
+  - `400` when `observation_id`/`id` is missing or the JSON body is invalid
+  - `404` when the observation does not exist
+  - Local-only: updating `review_after` does not enqueue a sync mutation or propagate to other machines.
+
 ### Search
 
 - `GET /search` — FTS5 search. Query: `?q=QUERY&type=TYPE&project=PROJECT&scope=SCOPE&limit=N`
