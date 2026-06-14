@@ -701,10 +701,16 @@ func (s *Store) JudgeRelation(p JudgeRelationParams) (*Relation, error) {
 func validateCrossProjectGuard(tx *sql.Tx, sourceID, targetID string) error {
 	var srcProject, tgtProject string
 	_ = tx.QueryRow(
-		`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, sourceID,
+		`SELECT coalesce(nullif(o.project,''), s.project, '')
+		   FROM observations o
+		   LEFT JOIN sessions s ON s.id = o.session_id
+		  WHERE o.sync_id = ?`, sourceID,
 	).Scan(&srcProject)
 	_ = tx.QueryRow(
-		`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, targetID,
+		`SELECT coalesce(nullif(o.project,''), s.project, '')
+		   FROM observations o
+		   LEFT JOIN sessions s ON s.id = o.session_id
+		  WHERE o.sync_id = ?`, targetID,
 	).Scan(&tgtProject)
 
 	if srcProject != "" && tgtProject != "" && srcProject != tgtProject {
@@ -840,13 +846,6 @@ func (s *Store) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 			enrollCheckProject = tgtProject
 		}
 
-		// REQ-011: log at WARNING level when source observation is missing locally
-		// (project='' race condition). The server will reject with 400; this log
-		// is the local breadcrumb so the gap is not silently swallowed.
-		if srcProject == "" {
-			log.Printf("[store] WARNING: JudgeBySemantic enqueueing relation %s with project='' (source observation missing locally); server will reject", existingSyncID)
-		}
-
 		var enrolled int
 		if err := tx.QueryRow(
 			`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, enrollCheckProject,
@@ -855,6 +854,13 @@ func (s *Store) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		}
 		if enrolled == 0 {
 			return nil // not enrolled — backfill will cover it on enrollment
+		}
+
+		// REQ-011: log at WARNING level when source observation is missing locally
+		// (project='' race condition). The server will reject with 400; this log
+		// is the local breadcrumb so the gap is not silently swallowed.
+		if srcProject == "" {
+			log.Printf("[store] WARNING: JudgeBySemantic enqueueing relation %s with project='' (source observation missing locally); server will reject", existingSyncID)
 		}
 
 		// Build payload from the freshly-written row.

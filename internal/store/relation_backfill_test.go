@@ -10,6 +10,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"testing"
 )
 
@@ -545,5 +546,96 @@ func TestJudgeBySemantic_UsesSessionFallback_ForProject(t *testing.T) {
 	}
 	if payloadProject != "proj-sf" {
 		t.Errorf("expected payload project %q, got %q", "proj-sf", payloadProject)
+	}
+}
+
+// ─── Test 7: cross-project guard uses session fallback ────────────────────────
+
+// TestCrossProjectGuard_SessionFallback_RejectsDifferentSessionProjects verifies
+// that validateCrossProjectGuard (used by both JudgeBySemantic and JudgeRelation)
+// rejects a relation whose observations have blank observations.project but whose
+// SESSIONS belong to DIFFERENT projects.
+//
+// This is the regression test for the bypass: without the session-fallback query
+// in validateCrossProjectGuard, the guard sees "" == "" and allows the relation,
+// even though the two observations live in different session-projects.
+func TestCrossProjectGuard_SessionFallback_RejectsDifferentSessionProjects(t *testing.T) {
+	s := newTestStore(t)
+
+	// Two sessions in DIFFERENT projects.
+	if err := s.CreateSession("ses-guard-p", "proj-guard-p", "/tmp/guard-p"); err != nil {
+		t.Fatalf("CreateSession p: %v", err)
+	}
+	if err := s.CreateSession("ses-guard-q", "proj-guard-q", "/tmp/guard-q"); err != nil {
+		t.Fatalf("CreateSession q: %v", err)
+	}
+
+	// Observations with blank observations.project — project lives only in session.
+	_, srcSyncID := addTestObsSession(t, s, "ses-guard-p", "Guard source obs", "decision", "", "project")
+	_, tgtSyncID := addTestObsSession(t, s, "ses-guard-q", "Guard target obs", "decision", "", "project")
+
+	// JudgeBySemantic must detect cross-project via session fallback and reject.
+	_, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:  srcSyncID,
+		TargetID:  tgtSyncID,
+		Relation:  RelationRelated,
+		Reasoning: "cross-project session-fallback guard test",
+		Model:     "test-model",
+	})
+	if !errors.Is(err, ErrCrossProjectRelation) {
+		t.Errorf("JudgeBySemantic: expected ErrCrossProjectRelation; got %v", err)
+	}
+
+	// JudgeRelation must also reject for the same reason.
+	relSyncID := newSyncID("rel")
+	if _, err2 := s.SaveRelation(SaveRelationParams{
+		SyncID:   relSyncID,
+		SourceID: srcSyncID,
+		TargetID: tgtSyncID,
+	}); err2 != nil {
+		t.Fatalf("SaveRelation: %v", err2)
+	}
+	_, err = s.JudgeRelation(JudgeRelationParams{
+		JudgmentID:    relSyncID,
+		Relation:      RelationRelated,
+		MarkedByActor: "agent:test",
+		MarkedByKind:  "agent",
+	})
+	if !errors.Is(err, ErrCrossProjectRelation) {
+		t.Errorf("JudgeRelation: expected ErrCrossProjectRelation; got %v", err)
+	}
+}
+
+// TestCrossProjectGuard_SessionFallback_AllowsSameSessionProject verifies that
+// the guard does NOT reject observations that share the same session project,
+// even when observations.project is blank. This guards against over-tightening.
+func TestCrossProjectGuard_SessionFallback_AllowsSameSessionProject(t *testing.T) {
+	s := newTestStore(t)
+
+	// Both observations in the SAME session (same project).
+	if err := s.CreateSession("ses-guard-same", "proj-guard-same", "/tmp/guard-same"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.EnrollProject("proj-guard-same"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+
+	// Both observations have blank observations.project but same session.
+	_, srcSyncID := addTestObsSession(t, s, "ses-guard-same", "Guard same src", "decision", "", "project")
+	_, tgtSyncID := addTestObsSession(t, s, "ses-guard-same", "Guard same tgt", "decision", "", "project")
+
+	// Must NOT return ErrCrossProjectRelation.
+	relSyncID, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:  srcSyncID,
+		TargetID:  tgtSyncID,
+		Relation:  RelationRelated,
+		Reasoning: "same session project guard test",
+		Model:     "test-model",
+	})
+	if err != nil {
+		t.Errorf("JudgeBySemantic: unexpected error for same-session-project pair: %v", err)
+	}
+	if relSyncID == "" {
+		t.Error("JudgeBySemantic: expected non-empty relSyncID for same-session-project pair")
 	}
 }
