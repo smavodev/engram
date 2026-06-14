@@ -5046,21 +5046,28 @@ func (s *Store) projectNeedsBackfill(project string) (bool, error) {
 			args: []any{project, project, DefaultSyncTargetKey, SyncEntityPrompt, SyncSourceLocal},
 		},
 		{
-			// Count non-orphaned relations whose source and target observations are
-			// locally available and that have no local upsert sync_mutations row.
-			// Mirrors the SELECT in backfillRelationSyncMutationsTx.
+			// Count only fully-judged relations (not orphaned, not pending, with
+			// marked_by_actor/kind populated) whose source and target observations
+			// are locally available and that have no local upsert sync_mutations row.
+			// Mirrors the SELECT in backfillRelationSyncMutationsTx exactly — any
+			// divergence causes the fast-path skip to desync from the write path.
+			// Pending/unmarked rows lack marked_by_* and would be rejected by cloud
+			// validation (HTTP 400), so we exclude them from both the count and the
+			// backfill to avoid polluting the sync journal with undeliverable mutations.
 			q: `SELECT COUNT(*)
 			    FROM memory_relations r
 			    JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
 			    JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
 			    LEFT JOIN sessions src_s ON src_s.id = src.session_id
-			    WHERE r.judgment_status != ?
+			    WHERE r.judgment_status NOT IN (?, ?)
+			      AND ifnull(r.marked_by_actor, '') != ''
+			      AND ifnull(r.marked_by_kind, '') != ''
 			      AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
 			      AND NOT EXISTS (
 			        SELECT 1 FROM sync_mutations sm
 			        WHERE sm.target_key = ? AND sm.entity = ? AND sm.entity_key = r.sync_id AND sm.source = ?
 			      )`,
-			args: []any{JudgmentStatusOrphaned, project, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal},
+			args: []any{JudgmentStatusOrphaned, JudgmentStatusPending, project, DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal},
 		},
 	}
 	for _, cq := range queries {
@@ -5398,6 +5405,11 @@ func (s *Store) backfillPromptSyncMutationsTx(tx *sql.Tx, project string) error 
 // intentionally omits that filter to avoid skipping cross-project edges where
 // only the source belongs to this project.
 func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) error {
+	// Only backfill fully-judged relations: exclude orphaned/pending and any row
+	// that is missing marked_by_actor or marked_by_kind.  Cloud validation
+	// (chunkcodec + server) hard-rejects mutations without those fields (HTTP 400),
+	// so enqueueing them would block the entire sync batch.
+	// This predicate must stay identical to the COUNT in projectNeedsBackfill.
 	rows, err := s.queryItHook(tx, `
 		SELECT r.sync_id, r.source_id, r.target_id, r.relation, r.reason, r.evidence, r.confidence,
 		       r.judgment_status, r.marked_by_actor, r.marked_by_kind, r.marked_by_model,
@@ -5408,7 +5420,9 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 		JOIN observations src ON src.sync_id = r.source_id AND src.deleted_at IS NULL
 		JOIN observations tgt ON tgt.sync_id = r.target_id AND tgt.deleted_at IS NULL
 		LEFT JOIN sessions src_s ON src_s.id = src.session_id
-		WHERE r.judgment_status != ?
+		WHERE r.judgment_status NOT IN (?, ?)
+		  AND ifnull(r.marked_by_actor, '') != ''
+		  AND ifnull(r.marked_by_kind, '') != ''
 		  AND coalesce(nullif(src.project, ''), src_s.project, '') = ?
 		  AND NOT EXISTS (
 		    SELECT 1 FROM sync_mutations sm
@@ -5418,7 +5432,7 @@ func (s *Store) backfillRelationSyncMutationsTx(tx *sql.Tx, project string) erro
 		      AND sm.source = ?
 		  )
 		ORDER BY r.created_at ASC, r.sync_id ASC`,
-		JudgmentStatusOrphaned,
+		JudgmentStatusOrphaned, JudgmentStatusPending,
 		project,
 		DefaultSyncTargetKey, SyncEntityRelation, SyncSourceLocal,
 	)

@@ -817,19 +817,36 @@ func (s *Store) JudgeBySemantic(p JudgeBySemanticParams) (string, error) {
 		resultSyncID = existingSyncID
 
 		// ── Enqueue sync mutation when project is enrolled ─────────────────────
-		// Derive source project for the enrollment check (mirrors JudgeRelation).
+		// Derive source project using the same session-fallback as the backfill
+		// SELECT: coalesce(nullif(obs.project,''), session.project, '').
+		// This prevents an empty Project in the enqueued payload when the
+		// observation's own project column is blank but the session carries it.
 		var srcProject, tgtProject string
 		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, p.SourceID,
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, p.SourceID,
 		).Scan(&srcProject)
 		_ = tx.QueryRow(
-			`SELECT ifnull(project,'') FROM observations WHERE sync_id = ?`, p.TargetID,
+			`SELECT coalesce(nullif(o.project,''), s.project, '')
+			   FROM observations o
+			   LEFT JOIN sessions s ON s.id = o.session_id
+			  WHERE o.sync_id = ?`, p.TargetID,
 		).Scan(&tgtProject)
 
 		enrollCheckProject := srcProject
 		if enrollCheckProject == "" {
 			enrollCheckProject = tgtProject
 		}
+
+		// REQ-011: log at WARNING level when source observation is missing locally
+		// (project='' race condition). The server will reject with 400; this log
+		// is the local breadcrumb so the gap is not silently swallowed.
+		if srcProject == "" {
+			log.Printf("[store] WARNING: JudgeBySemantic enqueueing relation %s with project='' (source observation missing locally); server will reject", existingSyncID)
+		}
+
 		var enrolled int
 		if err := tx.QueryRow(
 			`SELECT 1 FROM sync_enrolled_projects WHERE project = ? LIMIT 1`, enrollCheckProject,

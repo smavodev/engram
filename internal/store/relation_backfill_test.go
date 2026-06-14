@@ -37,7 +37,8 @@ func setupBackfillStore(t *testing.T) (s *Store, srcSyncID, tgtSyncID string) {
 
 // insertRelationDirect inserts a memory_relations row bypassing the normal
 // SaveRelation / JudgeRelation path so there is no corresponding sync_mutations
-// row. Used to simulate the pre-backfill gap.
+// row. Used to simulate the pre-backfill gap for rows that legitimately lack
+// marked_by_* fields (e.g. orphaned, pending).
 func insertRelationDirect(t *testing.T, s *Store, syncID, sourceID, targetID, judgmentStatus string) {
 	t.Helper()
 	if _, err := s.db.Exec(`
@@ -46,6 +47,23 @@ func insertRelationDirect(t *testing.T, s *Store, syncID, sourceID, targetID, ju
 		VALUES (?, ?, ?, 'related', ?, datetime('now'), datetime('now'))
 	`, syncID, sourceID, targetID, judgmentStatus); err != nil {
 		t.Fatalf("insertRelationDirect: %v", err)
+	}
+}
+
+// insertJudgedRelationDirect inserts a fully-judged memory_relations row with
+// marked_by_actor and marked_by_kind populated, mirroring what JudgeRelation
+// and JudgeBySemantic produce. Use this for fixtures that must be picked up
+// by the backfill (the tightened predicate excludes rows without marked_by_*).
+func insertJudgedRelationDirect(t *testing.T, s *Store, syncID, sourceID, targetID string) {
+	t.Helper()
+	if _, err := s.db.Exec(`
+		INSERT INTO memory_relations
+			(sync_id, source_id, target_id, relation, judgment_status,
+			 marked_by_actor, marked_by_kind,
+			 created_at, updated_at)
+		VALUES (?, ?, ?, 'related', 'judged', 'test-actor', 'agent', datetime('now'), datetime('now'))
+	`, syncID, sourceID, targetID); err != nil {
+		t.Fatalf("insertJudgedRelationDirect: %v", err)
 	}
 }
 
@@ -74,9 +92,11 @@ func countRelationSyncMutationsByKey(t *testing.T, s *Store, relSyncID string) i
 func TestBackfillRelationSyncMutations_CreatesRowForNonOrphaned(t *testing.T) {
 	s, srcSyncID, tgtSyncID := setupBackfillStore(t)
 
-	// Insert a judged relation directly — no sync_mutations row exists yet.
+	// Insert a judged relation directly (with marked_by_* fields populated) —
+	// no sync_mutations row exists yet. Uses insertJudgedRelationDirect because
+	// the tightened backfill predicate excludes rows without marked_by fields.
 	relSyncID := newSyncID("rel-bf-judged")
-	insertRelationDirect(t, s, relSyncID, srcSyncID, tgtSyncID, JudgmentStatusJudged)
+	insertJudgedRelationDirect(t, s, relSyncID, srcSyncID, tgtSyncID)
 
 	// Precondition: zero mutation rows for this relation.
 	if n := countRelationSyncMutationsByKey(t, s, relSyncID); n != 0 {
@@ -122,7 +142,7 @@ func TestBackfillRelationSyncMutations_SkipsAlreadyEnqueued(t *testing.T) {
 	s, srcSyncID, tgtSyncID := setupBackfillStore(t)
 
 	relSyncID := newSyncID("rel-bf-already")
-	insertRelationDirect(t, s, relSyncID, srcSyncID, tgtSyncID, JudgmentStatusJudged)
+	insertJudgedRelationDirect(t, s, relSyncID, srcSyncID, tgtSyncID)
 
 	// Run backfill twice.
 	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
@@ -272,9 +292,11 @@ func TestProjectNeedsBackfill_TrueWhenRelationMissingMutation(t *testing.T) {
 		t.Fatalf("EnrollProject: %v", err)
 	}
 
-	// Now insert a relation WITHOUT a sync_mutations row (simulates the gap).
+	// Now insert a judged relation WITHOUT a sync_mutations row (simulates the gap).
+	// Must use insertJudgedRelationDirect so marked_by_* fields are populated;
+	// the tightened predicate in projectNeedsBackfill requires them.
 	relSyncID := newSyncID("rel-needs-bf")
-	insertRelationDirect(t, s, relSyncID, src2, tgt2, JudgmentStatusJudged)
+	insertJudgedRelationDirect(t, s, relSyncID, src2, tgt2)
 
 	// projectNeedsBackfill must return true because the relation lacks a mutation.
 	needs, err := s.projectNeedsBackfill("proj-bf2")
@@ -423,5 +445,105 @@ func TestEnrollProject_BackfillsPreExistingRelations(t *testing.T) {
 	// Post-enrollment: the relation must now have a sync_mutations row.
 	if n := countRelationSyncMutationsByKey(t, s, relSyncID); n != 1 {
 		t.Errorf("expected 1 sync_mutations row for relation after EnrollProject backfill, got %d", n)
+	}
+}
+
+// ─── Test 5: pending rows are not backfilled ──────────────────────────────────
+
+// TestBackfillRelationSyncMutations_SkipsPending verifies that a pending
+// (unjudged) relation — which lacks marked_by_actor/marked_by_kind — is NOT
+// selected by the backfill and does NOT cause projectNeedsBackfill to return
+// true.  Enqueueing pending rows would produce cloud mutations that are
+// hard-rejected by server validation (HTTP 400), potentially blocking the
+// entire sync batch.
+func TestBackfillRelationSyncMutations_SkipsPending(t *testing.T) {
+	s, srcSyncID, tgtSyncID := setupBackfillStore(t)
+
+	// Insert a pending relation without marked_by_* fields (simulates a
+	// FindCandidates/SaveRelation row that has not been judged yet).
+	pendingRelSyncID := newSyncID("rel-bf-pending")
+	insertRelationDirect(t, s, pendingRelSyncID, srcSyncID, tgtSyncID, JudgmentStatusPending)
+
+	// Run backfill — the pending relation must be skipped.
+	if err := s.repairEnrolledProjectSyncMutations(); err != nil {
+		t.Fatalf("repairEnrolledProjectSyncMutations: %v", err)
+	}
+
+	// Backfill must NOT have created a sync_mutations row for the pending relation.
+	if n := countRelationSyncMutationsByKey(t, s, pendingRelSyncID); n != 0 {
+		t.Errorf("pending relation must NOT be backfilled (would fail cloud validation), got %d sync_mutations rows", n)
+	}
+
+	// projectNeedsBackfill must NOT return true because of the pending relation.
+	// (All sessions/observations were enrolled, so they are covered.)
+	needs, err := s.projectNeedsBackfill("proj-bf")
+	if err != nil {
+		t.Fatalf("projectNeedsBackfill: %v", err)
+	}
+	if needs {
+		t.Errorf("projectNeedsBackfill must NOT return true for a pending relation without marked_by_* fields")
+	}
+}
+
+// ─── Test 6: JudgeBySemantic uses session-fallback for project derivation ─────
+
+// TestJudgeBySemantic_UsesSessionFallback_ForProject verifies that
+// JudgeBySemantic derives the Project for the enqueued sync mutation via the
+// session-fallback (coalesce(obs.project, session.project)), not from
+// observations.project alone.
+//
+// When observations.project is blank but the session carries the project, the
+// payload's Project field must be non-empty so cloud validation passes.
+func TestJudgeBySemantic_UsesSessionFallback_ForProject(t *testing.T) {
+	s := newTestStore(t)
+
+	// Create a session with a project and enroll it.
+	if err := s.CreateSession("ses-sf", "proj-sf", "/tmp/sf"); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if err := s.EnrollProject("proj-sf"); err != nil {
+		t.Fatalf("EnrollProject: %v", err)
+	}
+
+	// Add observations with blank project — only the session carries the project.
+	// This simulates observations ingested before the project column was populated.
+	_, srcSyncID := addTestObsSession(t, s, "ses-sf", "SF source obs", "decision", "", "project")
+	_, tgtSyncID := addTestObsSession(t, s, "ses-sf", "SF target obs", "decision", "", "project")
+
+	// JudgeBySemantic must derive project via session fallback.
+	relSyncID, err := s.JudgeBySemantic(JudgeBySemanticParams{
+		SourceID:  srcSyncID,
+		TargetID:  tgtSyncID,
+		Relation:  RelationRelated,
+		Reasoning: "session-fallback test verdict",
+		Model:     "test-model",
+	})
+	if err != nil {
+		t.Fatalf("JudgeBySemantic: %v", err)
+	}
+	if relSyncID == "" {
+		t.Fatal("JudgeBySemantic: expected non-empty relSyncID")
+	}
+
+	// A sync_mutations row must exist (project is enrolled).
+	if n := countRelationSyncMutationsByKey(t, s, relSyncID); n != 1 {
+		t.Fatalf("expected 1 sync_mutations row, got %d", n)
+	}
+
+	// The enqueued payload's project must be non-empty (resolved via session).
+	var payloadProject string
+	if err := s.db.QueryRow(
+		`SELECT ifnull(json_extract(payload, '$.project'), '')
+		   FROM sync_mutations
+		  WHERE entity = ? AND entity_key = ? AND source = ?`,
+		SyncEntityRelation, relSyncID, SyncSourceLocal,
+	).Scan(&payloadProject); err != nil {
+		t.Fatalf("reading payload project: %v", err)
+	}
+	if payloadProject == "" {
+		t.Errorf("JudgeBySemantic enqueued payload has empty project; session fallback must populate it (got %q)", payloadProject)
+	}
+	if payloadProject != "proj-sf" {
+		t.Errorf("expected payload project %q, got %q", "proj-sf", payloadProject)
 	}
 }
