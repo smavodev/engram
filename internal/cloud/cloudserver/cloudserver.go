@@ -73,6 +73,8 @@ type CloudServer struct {
 	principalAuth    principalResolver
 	projectAuth      ProjectAuthorizer
 	principalProject PrincipalProjectAuthorizer
+	adminIdentity    AdminIdentityStore
+	managedHasher    *cloudauth.ManagedTokenHasher
 	dashboardAdmin   string
 	port             int
 	host             string
@@ -110,6 +112,18 @@ func WithProjectAuthorizer(authorizer ProjectAuthorizer) Option {
 func WithPrincipalProjectAuthorizer(authorizer PrincipalProjectAuthorizer) Option {
 	return func(s *CloudServer) {
 		s.principalProject = authorizer
+	}
+}
+
+func WithAdminIdentityStore(store AdminIdentityStore) Option {
+	return func(s *CloudServer) {
+		s.adminIdentity = store
+	}
+}
+
+func WithManagedTokenHasher(hasher *cloudauth.ManagedTokenHasher) Option {
+	return func(s *CloudServer) {
+		s.managedHasher = hasher
 	}
 }
 
@@ -250,6 +264,16 @@ func (s *CloudServer) routes() {
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
 	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
 	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
+	s.mux.HandleFunc("GET /admin/users", s.withAuth(s.handleAdminListUsers))
+	s.mux.HandleFunc("POST /admin/users", s.withAuth(s.handleAdminCreateUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/enable", s.withAuth(s.handleAdminEnableUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/disable", s.withAuth(s.handleAdminDisableUser))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminListTokens))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminCreateToken))
+	s.mux.HandleFunc("POST /admin/tokens/{tokenID}/revoke", s.withAuth(s.handleAdminRevokeToken))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/grants", s.withAuth(s.handleAdminListGrants))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants", s.withAuth(s.handleAdminCreateGrant))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants/{project}/revoke", s.withAuth(s.handleAdminRevokeGrant))
 }
 
 func (s *CloudServer) withAuth(next http.HandlerFunc) http.HandlerFunc {

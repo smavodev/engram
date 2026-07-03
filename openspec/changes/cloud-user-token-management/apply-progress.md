@@ -272,3 +272,209 @@ Exact unchecked task lines remaining in `tasks.md`:
 - PR1B code/test diff is above the preferred ~700-line target. It remains bounded to storage-only files, but reviewers may still prefer a split before commit/PR.
 - New cloudstore integration tests require `CLOUDSTORE_TEST_DSN` to execute against Postgres; in this environment they compile and skip.
 - Storage DTOs currently duplicate some auth-domain string values to avoid the existing `auth -> cloudstore` import direction. The next auth/server wiring slice should be careful not to create a cycle.
+
+---
+
+## PR3A apply update — admin API handlers and audit-backed mutations
+
+### Current branch
+
+`feat/cloud-user-token-management-admin-bootstrap`
+
+### Chain context
+
+- Tracker branch: `feat/cloud-user-token-management`
+- Parent branch for this feature-branch-chain slice: `feat/cloud-user-token-management-server-sync`
+- Current slice: bounded PR3A from PR 3 — admin authorization and storage-backed admin API/form handlers only
+- Prior committed slices supplied by parent context:
+  - PR1A auth foundation: `d4c3b38 feat(cloud): add auth principal foundation`
+  - PR1B storage foundation: `9defadf feat(cloud): add identity storage foundation`
+  - PR2 server sync grant enforcement: `2669f3b feat(cloud): enforce principal sync grants`
+- Out of scope for PR3A: dashboard session login/cookie revalidation, dashboard bootstrap first-admin flow, CLI bootstrap, dashboard rendered managed-user UX/templates, docs outside this progress/tasks update.
+
+### Structured status consumed / produced before apply
+
+```yaml
+schemaName: spec-driven
+changeName: cloud-user-token-management
+artifactStore: openspec
+planningHome:
+  root: /Users/alanbuscaglia/work/engram/openspec
+  changesDir: /Users/alanbuscaglia/work/engram/openspec/changes
+changeRoot: /Users/alanbuscaglia/work/engram/openspec/changes/cloud-user-token-management
+artifactPaths:
+  proposal: [openspec/changes/cloud-user-token-management/proposal.md]
+  specs: [openspec/changes/cloud-user-token-management/spec.md]
+  design: [openspec/changes/cloud-user-token-management/design.md]
+  tasks: [openspec/changes/cloud-user-token-management/tasks.md]
+  applyProgress: [openspec/changes/cloud-user-token-management/apply-progress.md]
+contextFiles:
+  proposal: [openspec/changes/cloud-user-token-management/proposal.md]
+  specs: [openspec/changes/cloud-user-token-management/spec.md]
+  design: [openspec/changes/cloud-user-token-management/design.md]
+  tasks: [openspec/changes/cloud-user-token-management/tasks.md]
+  applyProgress: [openspec/changes/cloud-user-token-management/apply-progress.md]
+artifacts:
+  proposal: done
+  specs: done
+  design: done
+  tasks: done
+  applyProgress: done
+taskProgress:
+  total: 55
+  complete: 18
+  remaining: 37
+applyState: ready
+dependencies:
+  apply: ready
+  verify: ready
+  sync: blocked
+  archive: blocked
+actionContext:
+  mode: repo-local
+  workspaceRoot: /Users/alanbuscaglia/work/engram
+  allowedEditRoots: [/Users/alanbuscaglia/work/engram]
+  warnings: []
+nextRecommended: continue PR3 dashboard-session/bootstrap/admin-login audit tasks or run sdd-verify on the bounded PR3A slice
+isNonAuthoritative: false
+```
+
+### Review workload / PR boundary
+
+- `tasks.md` forecast has `400-line budget risk: High` and `Chained PRs recommended: Yes`.
+- Parent provided a resolved bounded delivery path: feature-branch-chain PR3A, implementation limited to admin authorization and storage-backed admin API handlers.
+- This slice stayed inside `internal/cloud/cloudserver/` plus OpenSpec progress/task updates and did not expand into dashboard UX/bootstrap/CLI.
+
+### Completed in PR3A
+
+- Added RED handler tests in `internal/cloud/cloudserver/admin_handlers_test.go` proving:
+  - managed member principals receive `403` for user create/enable/disable, token create/revoke, and grant create/revoke;
+  - legacy admin principals also receive `403`, proving the handlers require a managed admin principal, not just an admin-shaped legacy/bootstrap identity;
+  - forbidden requests do not call mutation methods, do not create success audit events, and leave user/token/grant collections unchanged.
+- Added GREEN admin API/form-level handlers in `internal/cloud/cloudserver/admin_handlers.go` and route registration/options in `internal/cloud/cloudserver/cloudserver.go` for:
+  - `GET /admin/users`
+  - `POST /admin/users`
+  - `POST /admin/users/{principalID}/enable`
+  - `POST /admin/users/{principalID}/disable`
+  - `GET /admin/users/{principalID}/tokens`
+  - `POST /admin/users/{principalID}/tokens`
+  - `POST /admin/tokens/{tokenID}/revoke`
+  - `GET /admin/users/{principalID}/grants`
+  - `POST /admin/users/{principalID}/grants`
+  - `POST /admin/users/{principalID}/grants/{project}/revoke`
+- Added storage-backed handler boundary `AdminIdentityStore`, satisfied by existing cloudstore identity methods.
+- Added `WithAdminIdentityStore` and `WithManagedTokenHasher` options for cloudserver wiring/tests.
+- Added token issuance through `cloudauth.GenerateManagedToken("live")` and `ManagedTokenHasher.Hash`, returning raw token only in the token creation response.
+- Added sanitized token metadata responses that omit hash/raw token fields from token metadata list/create metadata.
+- Added RED/GREEN audit coverage for this PR3A slice: token create/revoke, user create/enable/disable, grant create/revoke, redacted audit metadata, and audit fail-closed behavior.
+- Admin/security mutation handlers synchronously insert `cloud_auth_audit_log` success events after authoritative mutation calls, avoiding false success audit records when storage validation/mutation fails. If post-mutation audit insertion fails, handlers return `500` so callers know the operation did not complete cleanly.
+
+### Persisted task checkbox updates
+
+The following task lines are now visibly checked in `openspec/changes/cloud-user-token-management/tasks.md`:
+
+- [x] RED: Add admin authorization tests in `internal/cloud/cloudserver/` proving only managed admin principals can create users, issue/revoke tokens, and create/revoke grants; members receive forbidden responses and no state changes.
+- [x] GREEN: Add admin form/API handlers under `internal/cloud/cloudserver/` for human user create/list/enable/disable, token create/list/revoke, and grant create/list/revoke, backed by cloudstore methods.
+
+The broader PR3 audit task lines remain unchecked because they also include admin login, dashboard bootstrap, and legacy recovery audit coverage, which are explicitly out of scope for PR3A.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| PR3A admin authorization | `internal/cloud/cloudserver/admin_handlers_test.go` | Handler integration with fakes | ✅ `go test ./internal/cloud/cloudserver ./internal/cloud/auth ./internal/cloud/cloudstore` passed before production edits | ✅ `go test ./internal/cloud/cloudserver -run 'TestAdminHandlers|TestAdminMutations'` failed to compile on missing `WithAdminIdentityStore` / `WithManagedTokenHasher` | ✅ Targeted admin handler tests passed after adding cloudserver options/routes/handlers | ✅ Added legacy-admin forbidden case in addition to managed member forbidden case; covered seven mutation routes and no-state-change assertions | ✅ Kept policy check in `requireManagedAdmin` and store boundary in `AdminIdentityStore` |
+| PR3A storage-backed admin APIs | `internal/cloud/cloudserver/admin_handlers_test.go` | Handler integration with fake storage | ✅ Existing cloudserver/auth/cloudstore packages green | ✅ Tests referenced absent admin routes/options before implementation; later metadata-shape refactor RED failed until `token_prefix` was snake_case | ✅ `go test ./internal/cloud/cloudserver -run 'TestAdminHandlers|TestAdminMutations'` passed | ✅ Covered create/list/enable/disable users, create/list/revoke tokens, create/list/revoke grants, show-once raw token, snake_case token metadata, and metadata redaction | ✅ Sanitized token metadata into a dedicated response DTO that omits hash/raw fields |
+| PR3A admin mutation audit | `internal/cloud/cloudserver/admin_handlers_test.go` | Handler integration with fake storage/audit | ✅ Existing cloudserver/auth/cloudstore packages green | ✅ Audit tests failed before admin handlers existed | ✅ Targeted admin handler tests passed after synchronous audit insertion | ✅ Covered all PR3A mutation action names and audit-insert failure preventing mutation | ✅ Centralized audit insertion in `recordAdminAudit`; no raw token/hash/bearer metadata is emitted |
+
+### Test Summary
+
+- Total tests written: 3 handler integration tests with subcases.
+- Total tests passing: targeted admin handler tests, cloudserver/auth/cloudstore package tests, and full repository test suite passed.
+- Layers used: Handler integration (3), Unit (0), E2E (0).
+- Approval tests: None — this slice added new API behavior rather than refactoring existing behavior.
+- Pure functions created: small response/audit/helper functions in `admin_handlers.go` (`sanitizeToken`, `sanitizeTokenList`, `decodeJSONBody`).
+
+### Verification run
+
+```bash
+go test ./internal/cloud/cloudserver ./internal/cloud/auth ./internal/cloud/cloudstore
+go test ./internal/cloud/cloudserver -run 'TestAdminHandlers|TestAdminMutations'
+go test ./...
+git diff --check
+```
+
+Results:
+
+- `go test ./internal/cloud/cloudserver ./internal/cloud/auth ./internal/cloud/cloudstore`: PASS.
+- `go test ./internal/cloud/cloudserver -run 'TestAdminHandlers|TestAdminMutations'`: PASS.
+- `go test ./...`: PASS.
+- `git diff --check`: PASS.
+
+### Files changed
+
+- `internal/cloud/cloudserver/admin_handlers.go`
+- `internal/cloud/cloudserver/admin_handlers_test.go`
+- `internal/cloud/cloudserver/cloudserver.go`
+- `openspec/changes/cloud-user-token-management/tasks.md`
+- `openspec/changes/cloud-user-token-management/apply-progress.md`
+
+### Changed-line estimate
+
+- Code/test diff before OpenSpec updates: approximately 826 added lines (`admin_handlers.go` 406 lines, `admin_handlers_test.go` 396 lines, `cloudserver.go` +24 lines).
+- Including task/progress artifact updates, the slice remains under the parent stop threshold of 900 implementation changed lines and does not include dashboard/bootstrap/CLI expansion.
+
+### Deviations from design
+
+- Admin handlers were implemented as JSON/API form-level `/admin/*` cloudserver endpoints for PR3A reviewability, not dashboard-rendered `/dashboard/admin/*` UX/templates. PR4 owns managed-user dashboard UX.
+- Cloudserver exposes explicit wiring options for the admin identity store and token hasher. Runtime CLI/config wiring for a dedicated managed-token pepper is not expanded in PR3A.
+- Audit insertion is synchronous and happens after mutation calls to avoid false success audit records. PR3A does not expand storage into multi-operation admin transactions, so a post-mutation audit insertion failure returns `500` after the authoritative mutation has occurred.
+
+### Remaining tasks
+
+Exact unchecked task lines remaining in `tasks.md` after PR3A:
+
+```markdown
+- [ ] RED: Add dashboard-session tests proving managed admin login succeeds, member admin access fails, disabled/demoted users lose access on the next protected request, and secure cookie attributes are set correctly.
+- [ ] GREEN: Update dashboard auth/session handling in `internal/cloud/cloudserver` and `internal/cloud/dashboard` so signed cookies carry principal claims but every protected request revalidates enabled state and role from storage.
+- [ ] RED: Add bootstrap tests for legacy dashboard/admin credential creating the first managed admin, rejecting duplicate first-admin bootstrap, and preventing accidental removal of the last usable managed admin path.
+- [ ] GREEN: Implement dashboard bootstrap route/handler and last-admin protections, treating `ENGRAM_CLOUD_ADMIN` as explicit bootstrap/recovery access after managed admins exist.
+- [ ] RED: Add audit tests for token create/revoke, user create/enable/disable, grant create/revoke, admin login, dashboard bootstrap, accepted/rejected legacy recovery actions, and redaction of raw tokens.
+- [ ] GREEN: Emit synchronous `cloud_auth_audit_log` events for admin/security mutations; fail authoritative admin mutations if audit insertion fails.
+- [ ] Verify: targeted admin/dashboard/bootstrap tests and `go test ./...`.
+- [ ] Rollback boundary: remove admin/bootstrap routes while retaining storage/auth foundation and legacy auth behavior.
+- [ ] RED: Add dashboard rendering/handler tests for `/dashboard/admin/users`, `/dashboard/admin/users/list`, token partials, grant partials, and contributor/managed-user separation.
+- [ ] GREEN: Update `internal/cloud/dashboard/dashboard.go` and related templ/templates/assets to show `Managed Users` separately from contributor analytics.
+- [ ] GREEN: Add server-rendered forms and HTMX-compatible partials for user create, enable/disable, token create/show-once, token revoke, grant create, and grant revoke.
+- [ ] TRIANGULATE: Test non-HTMX form POST/redirect behavior and HTMX partial responses; partials must be meaningful HTML without hidden client-side policy logic.
+- [ ] TRIANGULATE: Test empty states explaining deny-by-default project grants and token show-once warnings.
+- [ ] REFACTOR: Keep policy checks in server/auth/store layers; dashboard code must render outcomes, not make authorization decisions.
+- [ ] Verify: dashboard package tests plus `go test ./...`.
+- [ ] Rollback boundary: remove dashboard UI routes/templates without affecting already-tested admin handlers.
+- [ ] RED: Add CLI tests in `cmd/engram/` for `engram cloud bootstrap admin --username ...`, duplicate bootstrap refusal, optional token issuance printed once, optional project grants, invalid input, and audit event creation.
+- [ ] GREEN: Implement `engram cloud bootstrap admin` in `cmd/engram/cloud.go`, using cloud runtime DB configuration by default and an existing DSN override convention only if already present.
+- [ ] TRIANGULATE: Test that raw managed tokens are never persisted, logged, audited, rendered in token metadata lists, or printed except the creation/bootstrap response.
+- [ ] GREEN: Update docs discovery targets affected by cloud setup and sync auth, starting with `README.md`, `docs/`, `CONTRIBUTING.md`, and any cloud deployment docs found by `rg "ENGRAM_CLOUD_TOKEN|ENGRAM_CLOUD_ADMIN|ENGRAM_CLOUD_ALLOWED_PROJECTS|cloud bootstrap"`.
+- [ ] GREEN: Document managed users/tokens, dedicated token pepper, first-admin dashboard bootstrap, CLI bootstrap, project grants, deny-by-default managed principals, legacy env-token migration, and rollback to legacy sync credentials.
+- [ ] RED: Add regression tests that `/sync/*` route methods, paths, request schemas, and response schemas remain unchanged for existing clients.
+- [ ] GREEN: Fix any contract drift found by regression tests without changing MVP payloads.
+- [ ] REFACTOR: Run `gofmt` on touched Go files and remove any temporary test seams not needed by production behavior.
+- [ ] Verify: `go test ./...`, targeted cloud tests (`go test ./internal/cloud/... ./cmd/engram`), and `go test -cover ./...`.
+- [ ] Rollback boundary: revert CLI/docs/audit hardening slice while keeping prior reviewed server behavior intact.
+- [ ] Managed human users are distinct from contributor analytics.
+- [ ] Managed tokens authenticate principals; authorization uses principal role and project grants.
+- [ ] Token hashes use a dedicated cloud token pepper, not the dashboard/session signing secret.
+- [ ] Raw token values are shown once and never stored or audited.
+- [ ] Disabled users, revoked tokens, and revoked grants stop future access immediately.
+- [ ] Legacy `ENGRAM_CLOUD_TOKEN`, `ENGRAM_CLOUD_ADMIN`, and `ENGRAM_CLOUD_ALLOWED_PROJECTS` behavior remains compatible during migration.
+- [ ] Managed principals are deny-by-default for project sync.
+- [ ] Dashboard cookies are `HttpOnly`, `SameSite=Lax` or stronger, and `Secure` under HTTPS/production rules.
+- [ ] CLI and dashboard can create the first managed admin safely.
+- [ ] Audit events cover all required MVP identity/security actions without secret leakage.
+- [ ] Documentation matches real routes, commands, environment variables, and rollback behavior.
+```
+
+### Risks / follow-ups
+
+- PR3A intentionally does not wire dashboard sessions, bootstrap, CLI, or dashboard UX. Those remain the next PR3/PR4/PR5 slices.
+- Runtime serving still needs dedicated managed-token pepper/config wiring before token creation can be enabled outside explicit `WithManagedTokenHasher` construction.
+- The PR3A admin audit implementation avoids false success audit records by auditing after successful mutations, but it does not make audit+mutation a single database transaction; if audit insertion fails after mutation, the API returns `500` after state changed. A later hardening slice can add transactional composite store methods if needed.
