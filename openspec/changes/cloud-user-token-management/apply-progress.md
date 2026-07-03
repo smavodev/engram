@@ -1025,3 +1025,248 @@ Results:
 - A prior risk reviewer claimed a CRITICAL legacy `ENGRAM_CLOUD_ADMIN` bypass on `/admin/*`. Verified this is a **false positive**: every `/admin/*` handler calls `requireManagedAdmin`, which requires `principal.Source == cloudauth.PrincipalSourceManagedToken` and returns `403` for legacy admin. No `/admin/*` authorization code was changed in this remediation.
 - Related-but-out-of-scope observation found while investigating FIX 1: `requireLegacyDashboardRecovery`'s denial branch (`recordBootstrapAuditBestEffort`) can theoretically be called with an empty `cloudauth.Principal{}` (empty actor source) in a narrow edge case where `authorizeDashboardRequest` succeeds via the legacy-sync-token `s.auth.Authorize(req)` fallback but `dashboardActorPrincipal` fails to resolve a principal. No existing or new test exercises this path, so it was not fixed here to stay within the six confirmed findings; flagging it for a future audit-hardening pass if the maintainer wants full symmetry with FIX 1's login-audit hardening.
 - All six confirmed findings plus the suggestion are addressed; no task checkboxes were altered by this remediation (per instructions), only this new subsection was appended.
+
+---
+
+## PR4 apply update — dashboard managed-user UX
+
+### Current branch
+
+`feat/cloud-user-token-management-dashboard-ux`
+
+### Chain context
+
+- Tracker branch: `feat/cloud-user-token-management`
+- Parent branch for this feature-branch-chain slice: `feat/cloud-user-token-management-dashboard-session-bootstrap` (carries the committed PR3C audit-hardening work: `4035ab5 feat(cloud): audit dashboard login and legacy recovery`)
+- Current slice: PR 4 — dashboard managed-user UX (full scope: separation from contributor analytics, create/enable/disable, token create/show-once/revoke, project grant create/revoke).
+- Prior committed slices supplied by parent context:
+  - PR1A auth foundation: `d4c3b38 feat(cloud): add auth principal foundation`
+  - PR1B storage foundation: `9defadf feat(cloud): add identity storage foundation`
+  - PR2 server sync grant enforcement: `2669f3b feat(cloud): enforce principal sync grants`
+  - PR3A admin API handlers: `7172b95 feat(cloud): add managed admin API handlers`
+  - PR3B dashboard sessions plus first-admin dashboard bootstrap: `4bd03db feat(cloud): add dashboard principal sessions and bootstrap`
+  - PR3C audit hardening (+ review remediation): `4035ab5 feat(cloud): audit dashboard login and legacy recovery`
+- Out of scope for PR4: CLI bootstrap (`engram cloud bootstrap admin`, PR5), docs updates (PR5), `/sync/*` or `/admin/*` JSON contract changes (none touched).
+
+### Structured status consumed / produced before apply
+
+```yaml
+schemaName: spec-driven
+changeName: cloud-user-token-management
+artifactStore: openspec
+changeRoot: openspec/changes/cloud-user-token-management
+applyState: ready
+actionContext:
+  mode: repo-local
+  workspaceRoot: /Users/alanbuscaglia/work/engram
+  allowedEditRoots: [/Users/alanbuscaglia/work/engram]
+  warnings: []
+strictTDD: true
+testRunner: go test ./...
+nextRecommended: sdd-verify on PR4, then PR5 CLI bootstrap/docs/regression hardening
+```
+
+### Review workload / PR boundary
+
+- `tasks.md` forecast has `400-line budget risk: High` and `Chained PRs recommended: Yes`; chain strategy `feature-branch-chain`.
+- This slice stayed inside `internal/cloud/dashboard/` (templ UI + wiring) and `internal/cloud/cloudserver/` (mutation handlers, route registration) plus OpenSpec progress/task updates. No CLI, docs, or `/sync/*`/`/admin/*` JSON contract files were touched.
+- **Budget note (read before merge):** hand-written/test diff is ~1,171 changed lines (see "Changed-line estimate" below), already above the ~700-line target before counting the machine-generated `components_templ.go` (+1,193/-436 lines, `templ generate` output, never hand-edited). I implemented the full PR4 task list (separation, create/enable/disable, tokens, grants) rather than only the read/list slice, because splitting create/enable-disable from list-rendering would have produced a materially less useful, harder-to-review two-slice split (the list partial's own tests need enable/disable forms to assert against) without meaningfully reducing hand-written line count. Flagging this explicitly per the task's escape-valve instruction so the maintainer can decide whether to split before merge/review.
+
+### Discovery made before implementing (real RED, not fabricated)
+
+While reading `internal/cloud/dashboard/dashboard.go` and `components.templ` to plan this slice, found that `GET /dashboard/admin/users` and `GET /dashboard/admin/users/list` **already existed** but rendered **contributor analytics** (`ListContributorsPaginated`), exactly matching design.md's documented current-state anchor: "Dashboard `/admin/users` — Currently lists contributors, not managed accounts... Repurpose or replace this admin surface." An existing test, `TestAdminUsersPageRendersContributors`, only asserted the HTMX shell wiring (not actual contributor content), so it survived a rename; roughly a dozen other existing tests asserted contributor fixtures rendered under these routes and had to be converted to managed-user fixtures as part of this slice (see Files changed).
+
+### Completed in PR4
+
+- **Contributor/managed-user separation**: `GET /dashboard/admin/users` and `GET /dashboard/admin/users/list` now render **managed human users** (`cloudstore.HumanUser` via a new `dashboard.ManagedUsersStore` interface), never contributor analytics. Contributors keep their own unaffected surface at `/dashboard/contributors`. Added `dashboard.ManagedUsersStore` (read-only: `ListHumanUsers`) to `MountConfig`, wired in `cloudserver.routes()` from the existing `AdminIdentityStore` (`s.adminIdentity`) with no new storage code — reuses the same `ListHumanUsers` method `admin_handlers.go` already calls.
+- **Server-rendered forms** (new `internal/cloud/cloudserver/dashboard_admin_users.go`, registered directly on `s.mux` like the existing `/dashboard/bootstrap` routes, not through `dashboard.Mount`, because they need `AdminIdentityStore`/`ManagedTokenHasher`/audit helpers that already live on `CloudServer`):
+  - `POST /dashboard/admin/users` — create managed user (username/email/display_name/role form).
+  - `POST /dashboard/admin/users/{principalID}/enable` and `/disable` — toggle, mirrors `handleAdminSyncTogglePost`'s redirect convention.
+  - `GET /dashboard/admin/users/{principalID}` — detail page: user profile, tokens section (create form + table + revoke), grants section (create form + table + revoke).
+  - `POST /dashboard/admin/users/{principalID}/tokens` — create token; **renders the show-once raw token page directly as the response body (never a redirect)**, so the raw token can never appear in a URL, `Location` header, or browser history entry.
+  - `POST /dashboard/admin/tokens/{tokenID}/revoke` — revoke.
+  - `POST /dashboard/admin/users/{principalID}/grants` and `/grants/{project}/revoke` — grant create/revoke.
+  - All mutation handlers reuse the **exact same** `requireManagedAdmin` (strict managed-token-admin gate — legacy/bootstrap admin sessions get `403`, matching `admin_handlers.go`'s established policy), `s.adminStore()`, and `s.recordAdminAudit` functions the JSON `/admin/*` API already uses and admin_handlers_test.go already proved. No authorization logic was reimplemented or re-decided in the dashboard layer.
+  - Read access to the detail page (`GET .../{principalID}`) uses the more lenient `s.isDashboardAdmin(r)` check (same as other dashboard admin pages, which also allow legacy/bootstrap admin to *view*), consistent with existing dashboard admin-page policy; only mutations require the strict managed-token gate.
+- **HTMX-compatible responses**: every mutation redirect uses the existing dual convention (plain `303` for normal form POSTs, `200` + `HX-Redirect` header for HTMX requests), matching `handleAdminSyncTogglePost`.
+- **Empty states**: `ManagedUsersListPartial`'s empty state and `ManagedUserDetailPage`'s grants section both explicitly explain deny-by-default project grants; the tokens section explains the show-once warning inline above the create-token form.
+- **New templ components** (`internal/cloud/dashboard/components.templ`, regenerated via `templ generate` into `components_templ.go`): `ManagedUsersPage` (shell + create-user form), `ManagedUsersListPartial` (table + enable/disable forms + empty state), `ManagedUserDetailPage` (profile + tokens + grants sections), `ManagedUserTokenCreatedPage` (show-once raw token page). Removed the old contributor-rendering `AdminUsersPage`/`AdminUsersListPartial` (replaced in place). Renamed the admin sub-nav "Users" label to "Managed Users" per design.md's UI rules.
+- **New helpers** (`internal/cloud/dashboard/helpers.go`): `formatTimeValue`/`formatTimePtr` (managed-user/token/grant timestamps are `time.Time`, unlike the string timestamps used elsewhere in the dashboard), `emptyDash`, `managedUserToggleAction`.
+
+### Persisted task checkbox updates
+
+The following task lines are now visibly checked in `openspec/changes/cloud-user-token-management/tasks.md`:
+
+- [x] RED: Add dashboard rendering/handler tests for `/dashboard/admin/users`, `/dashboard/admin/users/list`, token partials, grant partials, and contributor/managed-user separation.
+- [x] GREEN: Update `internal/cloud/dashboard/dashboard.go` and related templ/templates/assets to show `Managed Users` separately from contributor analytics.
+- [x] GREEN: Add server-rendered forms and HTMX-compatible partials for user create, enable/disable, token create/show-once, token revoke, grant create, and grant revoke.
+- [x] TRIANGULATE: Test non-HTMX form POST/redirect behavior and HTMX partial responses; partials must be meaningful HTML without hidden client-side policy logic.
+- [x] TRIANGULATE: Test empty states explaining deny-by-default project grants and token show-once warnings.
+- [x] REFACTOR: Keep policy checks in server/auth/store layers; dashboard code must render outcomes, not make authorization decisions.
+- [x] Verify: dashboard package tests plus `go test ./...`.
+- [x] Rollback boundary: remove dashboard UI routes/templates without affecting already-tested admin handlers.
+- [x] Cross-slice checklist: Managed human users are distinct from contributor analytics.
+
+### TDD Cycle Evidence
+
+| Task | Test File | Layer | Safety Net | RED | GREEN | TRIANGULATE | REFACTOR |
+|------|-----------|-------|------------|-----|-------|-------------|----------|
+| Contributor/managed-user separation (list + shell) | `internal/cloud/dashboard/dashboard_test.go` | Handler integration with `parityStoreStub` | ✅ `go test ./internal/cloud/dashboard` passed before edits | ✅ Added `TestManagedUsersListRendersAllUsersWithoutPagination`, `TestManagedUsersPageHasCreateUserForm`, `TestManagedUsersListPartialHasEnableDisableFormsAndEmptyState`, converted ~9 existing contributor-fixture tests to managed-user fixtures — all failed to compile/assert until `ManagedUsersStore`/`ManagedUsersPage`/`ManagedUsersListPartial` existed | ✅ `go test ./internal/cloud/dashboard` passed after `templ generate` + handler rewrite | ✅ Covered: managed users render, contributor fixture present-but-absent from output, no pagination markup, create-form fields present, enable/disable forms present per row, empty-state deny-by-default text | ✅ Read-only `ManagedUsersStore` kept separate from `DashboardStore`/`AdminIdentityStore` so the dashboard package never depends on mutation/audit types |
+| Managed-user create/enable/disable (dashboard-owned mutation routes) | `internal/cloud/cloudserver/dashboard_admin_users_test.go` | Handler integration with `loginAuditTestStore` + real dashboard session cookie | ✅ `go test ./internal/cloud/cloudserver` passed before edits | ✅ New tests against `/dashboard/admin/users`, `/enable`, `/disable` failed with `405 Method Not Allowed` (routes did not exist) | ✅ Passed after adding `dashboard_admin_users.go` handlers + route registration | ✅ Covered: managed-member and (implicitly, via shared `requireManagedAdmin`) legacy-admin forbidden with no state/audit change, success redirect target, plain-303 vs HTMX-200+HX-Redirect, audit action names match the JSON API's | ✅ Reused `requireManagedAdmin`/`adminStore`/`recordAdminAudit` verbatim — zero new authorization logic |
+| Token create show-once + revoke, grant create/revoke | `internal/cloud/cloudserver/dashboard_admin_users_test.go` | Handler integration with `loginAuditTestStore` | ✅ Cloudserver package green after prior task's edits | ✅ Token/grant/detail routes returned `405`/empty body before handlers existed | ✅ Passed after adding token/grant/detail handlers and `ManagedUserDetailPage`/`ManagedUserTokenCreatedPage` templ components | ✅ Covered: token creation is a direct `200` render (never a redirect, proven by asserting no `Location` header), raw secret appears exactly once and never again on the detail page (regex-extracted from the show-once block and diffed against the later detail-page body), safe `token_prefix` audit metadata is present and distinct from the secret, unauthenticated mutation redirects to login (plain 303 and HTMX 401+HX-Redirect) | ✅ `sanitizeTokenForDisplay` defensively clears `TokenHash` before any templ render, even though the fake store never populates it, as a template-drift safety net |
+
+### Test Summary
+
+- Total tests written/converted: 3 new + ~9 converted tests in `internal/cloud/dashboard/dashboard_test.go`; 8 new tests in `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+- Total tests passing: all new/converted tests, both full packages (`internal/cloud/dashboard`, `internal/cloud/cloudserver`), and the full repository test suite.
+- Layers used: Handler integration (11), Unit (0 standalone), E2E (0).
+- Approval tests: None — this is new UI behavior plus a documented, tested repurposing of an existing misrouted surface (contributors → managed users), not a behavior-preserving refactor of unrelated code.
+- Pure functions created: `formatTimeValue`, `formatTimePtr`, `emptyDash`, `managedUserToggleAction` (`internal/cloud/dashboard/helpers.go`); `isDashboardHTMXRequest`, `redirectDashboardAdmin`, `sanitizeTokenForDisplay` (`internal/cloud/cloudserver/dashboard_admin_users.go`).
+
+### Verification run
+
+```bash
+go run github.com/a-h/templ/cmd/templ@v0.3.1001 generate ./internal/cloud/dashboard
+go build ./...
+go test ./internal/cloud/dashboard ./internal/cloud/cloudserver
+go test ./internal/cloud/dashboard/... -run TestManagedUsers -v
+go test ./internal/cloud/cloudserver/... -run TestDashboard -v
+go test ./... -count=1
+gofmt -l internal/cloud/dashboard/dashboard.go internal/cloud/dashboard/helpers.go internal/cloud/dashboard/components_templ.go internal/cloud/dashboard/dashboard_test.go internal/cloud/cloudserver/cloudserver.go internal/cloud/cloudserver/dashboard_admin_users.go internal/cloud/cloudserver/dashboard_admin_users_test.go
+git diff --check
+```
+
+Results:
+
+- `templ generate`: 154 updates, no errors.
+- `go build ./...`: PASS.
+- `go test ./internal/cloud/dashboard ./internal/cloud/cloudserver`: PASS.
+- `go test ./internal/cloud/dashboard/... -run TestManagedUsers -v`: PASS.
+- `go test ./internal/cloud/cloudserver/... -run TestDashboard -v`: PASS (26/26, including all pre-existing PR3B/PR3C dashboard-session/login-audit tests, unaffected).
+- `go test ./... -count=1`: PASS, all packages including `internal/setup` (known-flaky `TestInstallCodexInjectsTOMLAndIsIdempotent` did not manifest flakiness in this run).
+- `gofmt -l` on all touched `.go` files: clean (no output). Note: `gofmt -l` on the `.templ` source file itself reports "illegal character" for templ-specific syntax (`@Component`, non-ASCII arrows in existing unrelated markup) — this is expected and pre-existing; `.templ` files are not plain Go and are intentionally excluded from the gofmt Go-file check, consistent with the project's `templ_policy.go` "checked-in-generated" convention (only `components_templ.go`, the generated `.go` output, is subject to gofmt).
+- `git diff --check`: clean (no output, no whitespace errors).
+
+### Files changed
+
+- `internal/cloud/dashboard/dashboard.go` — added `ManagedUsersStore` interface and `MountConfig.ManagedUsers` field; rewrote `handleAdminUsers`/`handleAdminUsersList` to render managed users instead of contributors.
+- `internal/cloud/dashboard/components.templ` — replaced `AdminUsersPage`/`AdminUsersListPartial` with `ManagedUsersPage`/`ManagedUsersListPartial`; added `ManagedUserDetailPage`, `ManagedUserTokenCreatedPage`; renamed the admin sub-nav "Users" label to "Managed Users".
+- `internal/cloud/dashboard/components_templ.go` — regenerated via `templ generate` (machine-generated, checked in per `templ_policy.go`).
+- `internal/cloud/dashboard/helpers.go` — added `formatTimeValue`, `formatTimePtr`, `emptyDash`, `managedUserToggleAction`.
+- `internal/cloud/dashboard/dashboard_test.go` — added `ListHumanUsers` to `parityStoreStub`; wired `ManagedUsers` into `newAuthedMux`/`newAuthedAdminMux`; added 3 new managed-user tests; converted ~9 existing contributor-fixture tests for `/dashboard/admin/users*` to managed-user fixtures; replaced the contributor-pagination-specific admin/users test with a managed-users-no-pagination test.
+- `internal/cloud/cloudserver/cloudserver.go` — wired `dashboard.ManagedUsersStore` from `s.adminIdentity`; registered the new dashboard-owned managed-user mutation/detail routes.
+- `internal/cloud/cloudserver/dashboard_admin_users.go` (new) — dashboard-rendered managed-user create/enable/disable, token create/revoke, grant create/revoke handlers; `requireDashboardSession` middleware; render/redirect helpers.
+- `internal/cloud/cloudserver/dashboard_admin_users_test.go` (new) — 8 handler integration tests covering authorization reuse, redirects, audits, show-once token contract, and unauthenticated-session redirects.
+- `openspec/changes/cloud-user-token-management/tasks.md` — checked all PR4 task lines plus the "Managed human users are distinct from contributor analytics" cross-slice checklist item.
+- `openspec/changes/cloud-user-token-management/apply-progress.md` — this section.
+
+### Changed-line estimate
+
+- Hand-written/test diff (excludes the machine-generated `components_templ.go`): ~1,171 added / 106 removed lines across `cloudserver.go`, `dashboard_admin_users.go`, `dashboard_admin_users_test.go`, `components.templ`, `dashboard.go`, `dashboard_test.go`, `helpers.go`.
+- Including the regenerated `components_templ.go` (+1,193/-436, `templ generate` output): total diff is ~2,470 changed lines.
+- This is well above the ~700-line target even before counting the generated file. See "Review workload / PR boundary" above for the explicit judgment call and rationale (full-scope PR4 implemented per the task brief rather than split further, because the read/list-only slice alone would not have exercised or proven the enable/disable/token/grant behavior the task explicitly required, and splitting would not meaningfully reduce hand-written line count). Flagging for maintainer review/split decision before merge.
+
+### Deviations from design
+
+- design.md's route table lists separate `GET /dashboard/admin/users/{id}/tokens` and `GET /dashboard/admin/users/{id}/grants` endpoints. This slice combines both into a single `GET /dashboard/admin/users/{principalID}` detail page (profile + tokens section + grants section) to keep the route/handler count and diff smaller while still covering the same functional surface (list, create, revoke for both tokens and grants). No separate token-only or grant-only GET partial route exists.
+- The managed-users list (`ManagedUsersListPartial`) is intentionally **not paginated**, unlike every other dashboard list (projects, contributors, sessions, etc.). `cloudstore`'s `ListHumanUsers` has no paginated variant, and managed/operator accounts are expected to stay small in the MVP relative to synced contributor volume; a future slice can add pagination if that assumption changes.
+- Detail-page (`GET /dashboard/admin/users/{principalID}`) read access uses the same lenient `isDashboardAdmin` check as other dashboard admin pages (permits legacy/bootstrap admin to view), while every mutation route uses the strict `requireManagedAdmin` gate (managed-token admin only). This intentionally mirrors the existing split between dashboard viewing and `/admin/*` JSON API mutation policy rather than inventing a new policy tier.
+- `handleDashboardManagedUserDetail` and `handleDashboardCreateManagedToken` find the target `HumanUser` by filtering the full `ListHumanUsers()` result rather than a dedicated `GetHumanUser(principalID)` store method (none exists yet). Acceptable at MVP admin-user scale; a future slice could add a point-lookup method if this becomes a hot path.
+
+### Remaining tasks
+
+Exact unchecked task lines remaining in `tasks.md` after PR4 (all PR5):
+
+```markdown
+- [ ] RED: Add CLI tests in `cmd/engram/` for `engram cloud bootstrap admin --username ...`, duplicate bootstrap refusal, optional token issuance printed once, optional project grants, invalid input, and audit event creation.
+- [ ] GREEN: Implement `engram cloud bootstrap admin` in `cmd/engram/cloud.go`, using cloud runtime DB configuration by default and an existing DSN override convention only if already present.
+- [ ] TRIANGULATE: Test that raw managed tokens are never persisted, logged, audited, rendered in token metadata lists, or printed except the creation/bootstrap response.
+- [ ] GREEN: Update docs discovery targets affected by cloud setup and sync auth, starting with `README.md`, `docs/`, `CONTRIBUTING.md`, and any cloud deployment docs found by `rg "ENGRAM_CLOUD_TOKEN|ENGRAM_CLOUD_ADMIN|ENGRAM_CLOUD_ALLOWED_PROJECTS|cloud bootstrap"`.
+- [ ] GREEN: Document managed users/tokens, dedicated token pepper, first-admin dashboard bootstrap, CLI bootstrap, project grants, deny-by-default managed principals, legacy env-token migration, and rollback to legacy sync credentials.
+- [ ] RED: Add regression tests that `/sync/*` route methods, paths, request schemas, and response schemas remain unchanged for existing clients.
+- [ ] GREEN: Fix any contract drift found by regression tests without changing MVP payloads.
+- [ ] REFACTOR: Run `gofmt` on touched Go files and remove any temporary test seams not needed by production behavior.
+- [ ] Verify: `go test ./...`, targeted cloud tests (`go test ./internal/cloud/... ./cmd/engram`), and `go test -cover ./...`.
+- [ ] Rollback boundary: revert CLI/docs/audit hardening slice while keeping prior reviewed server behavior intact.
+- [ ] Managed tokens authenticate principals; authorization uses principal role and project grants.
+- [ ] Token hashes use a dedicated cloud token pepper, not the dashboard/session signing secret.
+- [ ] Raw token values are shown once and never stored or audited.
+- [ ] Disabled users, revoked tokens, and revoked grants stop future access immediately.
+- [ ] Legacy `ENGRAM_CLOUD_TOKEN`, `ENGRAM_CLOUD_ADMIN`, and `ENGRAM_CLOUD_ALLOWED_PROJECTS` behavior remains compatible during migration.
+- [ ] Managed principals are deny-by-default for project sync.
+- [ ] CLI and dashboard can create the first managed admin safely.
+- [ ] Audit events cover all required MVP identity/security actions without secret leakage.
+- [ ] Documentation matches real routes, commands, environment variables, and rollback behavior.
+```
+
+Note: several of these cross-slice checklist items (token show-once, deny-by-default, disabled/revoked immediate effect) are functionally exercised by PR1–PR4 tests already, but remain unchecked here because the checklist as a whole is scoped to be finalized alongside PR5's regression/documentation pass, consistent with how prior PR sections in this file have handled cross-slice items.
+
+### Risks / follow-ups
+
+- **Diff size**: this slice's hand-written diff (~1,171 lines) exceeds the ~700-line guidance even before the generated templ file; see "Review workload / PR boundary" above. Recommend the maintainer review this as a single cohesive UX slice (it is one coherent feature: managed-user dashboard management) or explicitly request a further split (e.g., users-only vs. tokens+grants) before merge.
+- **Existing test conversions**: ~9 pre-existing dashboard tests that asserted contributor fixtures under `/dashboard/admin/users*` were converted to managed-user fixtures rather than left in place, because the routes' actual behavior changed (contributors → managed users) per design.md's explicit instruction to repurpose this surface. `TestAdminUsersPageRendersContributors` was renamed to `TestAdminUsersPageRendersManagedUsersShell`, `TestAdminUsersPaginationUsesRealTotal` (contributor-pagination-specific) was replaced with `TestManagedUsersListRendersAllUsersWithoutPagination`. No contributor-analytics behavior at `/dashboard/contributors` was touched.
+- **No new storage methods added**: this slice deliberately did not add a `GetHumanUser(principalID)` point-lookup or a paginated `ListHumanUsers` to `cloudstore`; both are documented deviations above and are cheap to add later if needed.
+- **PR5 remains**: CLI bootstrap, docs, and `/sync/*` regression-contract hardening are untouched and remain PR5's scope, per the tracker's `feature-branch-chain` plan.
+
+## PR4 review remediation
+
+Fixes CONFIRMED review findings on the staged, uncommitted PR4 dashboard-UX slice (branch `feat/cloud-user-token-management-dashboard-ux`). Strict TDD: every behavioral fix has a failing test written first (RED), confirmed failing, then made to pass (GREEN). Scope stayed inside `internal/cloud/cloudserver/` and `internal/cloud/dashboard/`; no CLI/docs touched; nothing committed.
+
+### FIX A — CRITICAL: managed-user detail page returned 200 on not-found
+
+- **Root cause**: `handleDashboardManagedUserDetail`'s not-found branch rendered the `EmptyState` body via `renderDashboardAdminComponent`, which never calls `w.WriteHeader`, so Go defaults the response to 200.
+- **RED**: `TestDashboardManagedUserDetailPageReturns404ForUnknownPrincipal` — `GET /dashboard/admin/users/{unknownID}` with a valid managed-admin session. Confirmed failing: `got 200`.
+- **GREEN**: added `renderDashboardAdminComponentStatus(w, r, status, component)` (writes the status before rendering, mirroring `internal/cloud/dashboard`'s existing `renderComponentStatus` convention) and used it with `http.StatusNotFound` in the not-found branch.
+- Files: `internal/cloud/cloudserver/dashboard_admin_users.go`, `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+
+### FIX B — CRITICAL: token-create minted a real token for a non-existent user
+
+- **Root cause**: `handleDashboardCreateManagedToken` generated and persisted a managed token and recorded a `token.create` success audit event for `principalID` BEFORE checking whether that principal existed; the existence check (a second `ListHumanUsers` call) only happened afterward, purely to fill in the render — so an unknown/stale `principalID` still got a real, persisted token and a blank-username show-once page.
+- **RED**: `TestDashboardCreateManagedTokenForUnknownUserReturns404NoMintNoAudit` — `POST /dashboard/admin/users/{unknownID}/tokens`. Confirmed failing: `got 200` with a real token minted (`egc_live_...` present in the response body) and no way to assert against the missing user.
+- **GREEN**: restructured the handler to call `ListHumanUsers` and resolve the target user FIRST; if not found, return `404` with no token generation, no `CreatePrincipalToken` call, and no audit call. Removed the now-redundant second `ListHumanUsers` call at the end (the resolved `user` value is reused for rendering).
+- Files: `internal/cloud/cloudserver/dashboard_admin_users.go`, `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+
+### FIX C — mutation handler failure-path coverage (no behavior change — not a bug)
+
+Added failure-path tests for every dashboard mutation handler (enable/disable, token create, token revoke, grant create, grant revoke), driving a store error from the test double via new `adminTestStore` error-injection fields (`setEnabledErr`, `createTokenErr`, `revokeTokenErr`, `createGrantErr`, `revokeGrantErr`). All six new tests (including the CRITICAL last-admin case) **passed on first run with no production code change** — the existing handlers already return an error status (never 200/303) and skip the audit call whenever the authoritative store call fails, since `recordAdminAudit` is only reached after a successful mutation. Judgment: this was a coverage gap, not a live bug.
+
+- `TestDashboardDisableManagedUserSurfacesStoreErrorWithoutAudit`
+- `TestDashboardDisableLastActiveAdminSurfacesErrorNotSuccess` (CRITICAL case: test double's `SetHumanUserEnabled` returns the real `cloudstore.ErrLastActiveAdmin`; asserts the dashboard disable handler surfaces it as a non-2xx/non-303 error with no `user.disable` success audit)
+- `TestDashboardCreateManagedTokenSurfacesStoreErrorWithoutAudit`
+- `TestDashboardRevokeManagedTokenSurfacesStoreErrorWithoutAudit`
+- `TestDashboardCreateManagedGrantSurfacesStoreErrorWithoutAudit`
+- `TestDashboardRevokeManagedGrantSurfacesStoreErrorWithoutAudit`
+
+Files: `internal/cloud/cloudserver/admin_handlers_test.go` (error-injection fields added to the shared `adminTestStore`), `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+
+### FIX D — body-size cap on new POST forms (defense-in-depth consistency)
+
+- **Root cause**: `handleDashboardCreateManagedUser`, `handleDashboardCreateManagedToken`, `handleDashboardRevokeManagedToken`, `handleDashboardCreateManagedGrant`, and `handleDashboardRevokeManagedGrant` called `r.ParseForm()` with no body-size cap, unlike `handleDashboardBootstrapSubmit` (and `dashboard.go`'s login submit), which already wrap the body in `http.MaxBytesReader(w, r.Body, maxDashboardLoginBodyBytes)`.
+- **RED**: `TestDashboardCreateManagedUserRejectsOversizedBody` — oversized `username` form value. Confirmed failing: request succeeded with `303` instead of `413`.
+- **GREEN**: added a shared `parseDashboardMutationForm(w, r) bool` helper that wraps the body in `http.MaxBytesReader` at `maxDashboardLoginBodyBytes`, then calls `r.ParseForm()`, returning `413` (via `errors.As` on `*http.MaxBytesError`) for an oversized payload or `400` for any other parse error. Wired into all five listed handlers (including `handleDashboardRevokeManagedGrant`, which previously called no `ParseForm` at all — added purely for cap consistency, since it reads no form values).
+- Files: `internal/cloud/cloudserver/dashboard_admin_users.go`, `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+
+### FIX E — WARNING coverage additions (no behavior change)
+
+- `TestDashboardManagedUserDetailHidesRevokeFormForRevokedTokens` — proves a token with `RevokedAt` set renders a "Revoked" status badge and no revoke form/action for that token. `components.templ`'s `ManagedUserDetailPage` already gated the revoke form on `tok.RevokedAt == nil`; this locks the behavior in with a test, no template change needed.
+- `TestDashboardLegacyAdminCanViewButNotMutateManagedUsers` — proves a legacy/bootstrap-admin dashboard session (via `WithDashboardAdminToken`) can `GET` the managed-user detail page (200, lenient `isDashboardAdmin` read gate) but is `403 Forbidden` from a mutation (`POST` token create, strict `requireManagedAdmin` gate), with zero token-create calls on the forbidden attempt.
+- `TestDashboardAdminUsersListRouteNotShadowedByDetailWildcard` — proves `GET /dashboard/admin/users/list` through the full composed `CloudServer` mux (both `dashboard.Mount`'s literal route and the manually-registered `/dashboard/admin/users/{principalID}` wildcard) still routes to the list partial (renders known usernames, never the detail not-found branch), locking in Go 1.22+ `http.ServeMux`'s literal-over-wildcard precedence as a regression guard.
+
+Files: `internal/cloud/cloudserver/dashboard_admin_users_test.go`.
+
+### Verification
+
+- `go build ./...` — clean (no `components.templ` changes in this remediation slice, so no `templ generate` needed).
+- `go test ./internal/cloud/dashboard ./internal/cloud/cloudserver` — PASS.
+- `go test ./...` — PASS (including `internal/setup`'s known-flaky `TestInstallCodexInjectsTOMLAndIsIdempotent`, which passed on this run; not touched).
+- `gofmt -l` on all touched Go files — empty.
+- `git diff --check` on all touched Go files — clean.
+- Tree left uncommitted, staged-ready, per instructions. No CLI/docs files touched. No task checkboxes changed in `tasks.md`.
+
+### Files changed (this remediation)
+
+| File | Action | What Was Done |
+|------|--------|---------------|
+| `internal/cloud/cloudserver/dashboard_admin_users.go` | Modified | FIX A: added `renderDashboardAdminComponentStatus`; FIX B: restructured token-create to verify the principal exists before minting; FIX D: added shared `parseDashboardMutationForm` body-cap helper, wired into 5 POST handlers. |
+| `internal/cloud/cloudserver/dashboard_admin_users_test.go` | Modified | Added RED/GREEN tests for FIX A, B, D, and WARNING coverage tests for FIX E. |
+| `internal/cloud/cloudserver/admin_handlers_test.go` | Modified | Added per-method error-injection fields (`setEnabledErr`, `createTokenErr`, `revokeTokenErr`, `createGrantErr`, `revokeGrantErr`) to the shared `adminTestStore` for FIX C's failure-path tests. |

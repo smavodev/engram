@@ -25,6 +25,15 @@ type adminTestStore struct {
 	auditErr      error
 	createUserErr error
 
+	// PR4 review remediation (FIX C): per-method error injection so tests can
+	// prove mutation handlers surface store failures as errors instead of
+	// partial success, without adding a partial-success audit event.
+	setEnabledErr  error
+	createTokenErr error
+	revokeTokenErr error
+	createGrantErr error
+	revokeGrantErr error
+
 	createUserCalls  int
 	setEnabledCalls  int
 	createTokenCalls int
@@ -64,6 +73,9 @@ func (s *adminTestStore) ListHumanUsers(context.Context) ([]cloudstore.HumanUser
 
 func (s *adminTestStore) SetHumanUserEnabled(_ context.Context, principalID string, enabled bool) error {
 	s.setEnabledCalls++
+	if s.setEnabledErr != nil {
+		return s.setEnabledErr
+	}
 	for i := range s.users {
 		if s.users[i].PrincipalID == principalID {
 			s.users[i].Enabled = enabled
@@ -75,6 +87,9 @@ func (s *adminTestStore) SetHumanUserEnabled(_ context.Context, principalID stri
 
 func (s *adminTestStore) CreatePrincipalToken(_ context.Context, params cloudstore.CreatePrincipalTokenParams) (cloudstore.PrincipalToken, error) {
 	s.createTokenCalls++
+	if s.createTokenErr != nil {
+		return cloudstore.PrincipalToken{}, s.createTokenErr
+	}
 	token := cloudstore.PrincipalToken{
 		ID:                   "tok-" + params.PrincipalID,
 		PrincipalID:          strings.TrimSpace(params.PrincipalID),
@@ -100,6 +115,9 @@ func (s *adminTestStore) ListPrincipalTokens(_ context.Context, principalID stri
 
 func (s *adminTestStore) RevokePrincipalToken(_ context.Context, tokenID, revokedByPrincipalID, reason string) error {
 	s.revokeTokenCalls++
+	if s.revokeTokenErr != nil {
+		return s.revokeTokenErr
+	}
 	now := time.Date(2026, 7, 3, 12, 2, 0, 0, time.UTC)
 	for i := range s.tokens {
 		if s.tokens[i].ID == tokenID {
@@ -114,6 +132,9 @@ func (s *adminTestStore) RevokePrincipalToken(_ context.Context, tokenID, revoke
 
 func (s *adminTestStore) CreateProjectGrant(_ context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error) {
 	s.createGrantCalls++
+	if s.createGrantErr != nil {
+		return cloudstore.ProjectGrant{}, s.createGrantErr
+	}
 	grant := cloudstore.ProjectGrant{
 		PrincipalID:          strings.TrimSpace(params.PrincipalID),
 		Project:              strings.TrimSpace(params.Project),
@@ -136,6 +157,9 @@ func (s *adminTestStore) ListProjectGrants(_ context.Context, principalID string
 
 func (s *adminTestStore) RevokeProjectGrant(_ context.Context, principalID, project string) error {
 	s.revokeGrantCalls++
+	if s.revokeGrantErr != nil {
+		return s.revokeGrantErr
+	}
 	kept := s.grants[:0]
 	for _, grant := range s.grants {
 		if grant.PrincipalID == principalID && grant.Project == project {

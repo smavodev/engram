@@ -63,14 +63,14 @@ Risks and dependencies:
 
 ### PR 4 — Dashboard managed-user UX
 
-- [ ] RED: Add dashboard rendering/handler tests for `/dashboard/admin/users`, `/dashboard/admin/users/list`, token partials, grant partials, and contributor/managed-user separation.
-- [ ] GREEN: Update `internal/cloud/dashboard/dashboard.go` and related templ/templates/assets to show `Managed Users` separately from contributor analytics.
-- [ ] GREEN: Add server-rendered forms and HTMX-compatible partials for user create, enable/disable, token create/show-once, token revoke, grant create, and grant revoke.
-- [ ] TRIANGULATE: Test non-HTMX form POST/redirect behavior and HTMX partial responses; partials must be meaningful HTML without hidden client-side policy logic.
-- [ ] TRIANGULATE: Test empty states explaining deny-by-default project grants and token show-once warnings.
-- [ ] REFACTOR: Keep policy checks in server/auth/store layers; dashboard code must render outcomes, not make authorization decisions.
-- [ ] Verify: dashboard package tests plus `go test ./...`.
-- [ ] Rollback boundary: remove dashboard UI routes/templates without affecting already-tested admin handlers.
+- [x] RED: Add dashboard rendering/handler tests for `/dashboard/admin/users`, `/dashboard/admin/users/list`, token partials, grant partials, and contributor/managed-user separation.
+- [x] GREEN: Update `internal/cloud/dashboard/dashboard.go` and related templ/templates/assets to show `Managed Users` separately from contributor analytics.
+- [x] GREEN: Add server-rendered forms and HTMX-compatible partials for user create, enable/disable, token create/show-once, token revoke, grant create, and grant revoke.
+- [x] TRIANGULATE: Test non-HTMX form POST/redirect behavior and HTMX partial responses; partials must be meaningful HTML without hidden client-side policy logic.
+- [x] TRIANGULATE: Test empty states explaining deny-by-default project grants and token show-once warnings.
+- [x] REFACTOR: Keep policy checks in server/auth/store layers; dashboard code must render outcomes, not make authorization decisions.
+- [x] Verify: dashboard package tests plus `go test ./...`.
+- [x] Rollback boundary: remove dashboard UI routes/templates without affecting already-tested admin handlers.
 
 ### PR 5 — CLI bootstrap, docs, and final hardening
 
@@ -87,7 +87,7 @@ Risks and dependencies:
 
 ## Cross-Slice Acceptance Checklist
 
-- [ ] Managed human users are distinct from contributor analytics.
+- [x] Managed human users are distinct from contributor analytics.
 - [ ] Managed tokens authenticate principals; authorization uses principal role and project grants.
 - [ ] Token hashes use a dedicated cloud token pepper, not the dashboard/session signing secret.
 - [ ] Raw token values are shown once and never stored or audited.
