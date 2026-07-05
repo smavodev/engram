@@ -183,6 +183,23 @@ func TestDashboardManagedUserDetailPageRendersTokensAndGrants(t *testing.T) {
 	}
 }
 
+func TestDashboardManagedUserDetailPageDisabledUserHidesTokenCreateForm(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-disabled", Username: "disabled-user", Role: "member", Enabled: false})
+
+	rec := performDashboardRequest(srv, http.MethodGet, "/dashboard/admin/users/p-disabled", cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for disabled managed user detail page, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `action="/dashboard/admin/users/p-disabled/tokens"`) || strings.Contains(body, "Create Token") {
+		t.Fatalf("disabled managed user detail page must not present active token creation affordance, body=%q", body)
+	}
+	if !strings.Contains(body, "Enable this managed user before creating a managed token.") {
+		t.Fatalf("expected inline disabled-user token creation guidance, body=%q", body)
+	}
+}
+
 // TestDashboardCreateManagedTokenShowsRawTokenOnceAndSanitizesFutureViews
 // proves the show-once contract end to end: the token-created response body
 // contains the raw token exactly once, is a direct POST response (never a
@@ -388,7 +405,7 @@ func TestDashboardCreateManagedTokenForUnknownUserReturns404NoMintNoAudit(t *tes
 	}
 }
 
-func TestDashboardCreateManagedTokenRejectsDisabledUserWithoutMinting(t *testing.T) {
+func TestDashboardCreateManagedTokenRejectsDisabledUserWithStyledErrorWithoutMinting(t *testing.T) {
 	srv, store, cookie := dashboardAdminUsersTestServer(t)
 	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-disabled", Username: "disabled-user", Role: "member", Enabled: false})
 
@@ -396,7 +413,15 @@ func TestDashboardCreateManagedTokenRejectsDisabledUserWithoutMinting(t *testing
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 conflict for disabled managed user token create, got %d body=%q", rec.Code, rec.Body.String())
 	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("expected disabled-user rejection to render a dashboard HTML page, got Content-Type=%q body=%q", contentType, rec.Body.String())
+	}
 	body := rec.Body.String()
+	for _, marker := range []string{"<!doctype html>", "Engram Cloud", "Cannot Create Token", "Enable this managed user before creating a managed token.", "disabled-user"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("expected styled disabled-user error page marker %q, body=%q", marker, body)
+		}
+	}
 	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
 		t.Fatalf("disabled-user rejection must not render raw token material, body=%q", body)
 	}
@@ -447,7 +472,15 @@ func TestDashboardCreateManagedTokenStoreDisabledRaceReturns409WithoutPersisting
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 when store rejects disabled principal after pre-check, got %d body=%q", rec.Code, rec.Body.String())
 	}
+	if contentType := rec.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/html") {
+		t.Fatalf("expected store-level disabled rejection to render a dashboard HTML page, got Content-Type=%q body=%q", contentType, rec.Body.String())
+	}
 	body := rec.Body.String()
+	for _, marker := range []string{"<!doctype html>", "Engram Cloud", "Cannot Create Token", "Enable this managed user before creating a managed token.", "race"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("expected styled store-level disabled error page marker %q, body=%q", marker, body)
+		}
+	}
 	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
 		t.Fatalf("store-level disabled rejection must not render raw token material, body=%q", body)
 	}

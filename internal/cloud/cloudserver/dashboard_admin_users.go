@@ -289,7 +289,7 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		return
 	}
 	if !user.Enabled {
-		http.Error(w, disabledManagedUserTokenMessage(principalID), http.StatusConflict)
+		s.renderDashboardManagedTokenDisabled(w, r, user)
 		return
 	}
 	managedToken, err := cloudauth.GenerateManagedToken("live")
@@ -311,7 +311,7 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 	})
 	if err != nil {
 		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
-			http.Error(w, disabledManagedUserTokenMessage(principalID), http.StatusConflict)
+			s.renderDashboardManagedTokenDisabled(w, r, user)
 			return
 		}
 		if errors.Is(err, cloudstore.ErrPrincipalNotFound) {
@@ -326,6 +326,14 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		return
 	}
 	renderDashboardAdminComponent(w, r, s.dashboardAdminLayout(r, "Token Created", dashboard.ManagedUserTokenCreatedPage(user, managedToken.Raw, sanitizeTokenForDisplay(token))))
+}
+
+func (s *CloudServer) renderDashboardManagedTokenDisabled(w http.ResponseWriter, r *http.Request, user cloudstore.HumanUser) {
+	message := "Enable this managed user before creating a managed token."
+	if strings.TrimSpace(user.Username) != "" {
+		message = fmt.Sprintf("%s User %s is currently disabled.", message, user.Username)
+	}
+	renderDashboardAdminComponentStatus(w, r, http.StatusConflict, s.dashboardAdminLayout(r, "Cannot Create Token", dashboard.EmptyState("Cannot Create Token", message)))
 }
 
 // sanitizeTokenForDisplay clears the token hash before handing a
