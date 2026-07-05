@@ -138,6 +138,9 @@ func TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle(t *testing.T) {
 	if users[0].Enabled {
 		t.Fatalf("disabled human user should list as disabled: %+v", users[0])
 	}
+	if err := cs.SetHumanUserEnabled(ctx, human.PrincipalID, true); err != nil {
+		t.Fatalf("SetHumanUserEnabled(true): %v", err)
+	}
 
 	token, err := cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: human.PrincipalID, TokenPrefix: "egc_live_ab12cd34", TokenHash: "hmac-sha256:v1:hash-only", Name: "laptop", CreatedByPrincipalID: principal.ID})
 	if err != nil {
@@ -202,6 +205,31 @@ func TestCloudstorePrincipalHumanTokenGrantAndAuditLifecycle(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Action != "grant.revoke" || events[0].Metadata["token_prefix"] != "egc_live_ab12cd34" {
 		t.Fatalf("auth audit event mismatch: %+v", events)
+	}
+}
+
+func TestCreatePrincipalTokenRejectsDisabledPrincipalWithoutPersisting(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	user, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "disabled-token-target", Email: "disabled-token-target@example.test", DisplayName: "Disabled Target", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreateHumanUser: %v", err)
+	}
+	if err := cs.SetHumanUserEnabled(ctx, user.PrincipalID, false); err != nil {
+		t.Fatalf("SetHumanUserEnabled(false): %v", err)
+	}
+
+	_, err = cs.CreatePrincipalToken(ctx, CreatePrincipalTokenParams{PrincipalID: user.PrincipalID, TokenPrefix: "egc_live_disabled", TokenHash: "hmac-sha256:v1:disabled-hash", Name: "blocked"})
+	if !errors.Is(err, ErrPrincipalDisabled) {
+		t.Fatalf("expected ErrPrincipalDisabled for disabled principal token create, got %v", err)
+	}
+	tokens, err := cs.ListPrincipalTokens(ctx, user.PrincipalID)
+	if err != nil {
+		t.Fatalf("ListPrincipalTokens after disabled create attempt: %v", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("disabled principal token create must not persist metadata, got %+v", tokens)
 	}
 }
 

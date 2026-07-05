@@ -27,6 +27,8 @@ var (
 	ErrLastActiveAdmin        = errors.New("cloudstore: cannot remove last active admin")
 	ErrSensitiveAuditMetadata = errors.New("cloudstore: sensitive auth audit metadata is not allowed")
 	ErrAdminAlreadyExists     = errors.New("cloudstore: a managed admin already exists")
+	ErrPrincipalNotFound      = errors.New("cloudstore: principal not found")
+	ErrPrincipalDisabled      = errors.New("cloudstore: principal is disabled")
 	ErrPrincipalTokenNotFound = errors.New("cloudstore: principal token not found")
 )
 
@@ -411,10 +413,36 @@ func (cs *CloudStore) CreatePrincipalToken(ctx context.Context, params CreatePri
 		return PrincipalToken{}, fmt.Errorf("cloudstore: token hash is required")
 	}
 	const q = `
+		WITH target_principal AS (
+			SELECT id
+			FROM cloud_principals
+			WHERE id = $1 AND enabled = TRUE
+			FOR UPDATE
+		)
 		INSERT INTO cloud_principal_tokens (principal_id, token_prefix, token_hash, name, created_by_principal_id)
-		VALUES ($1, $2, $3, $4, $5)
+		SELECT p.id, $2, $3, $4, $5
+		FROM target_principal p
 		RETURNING id::text, principal_id::text, token_prefix, '' AS token_hash, name, COALESCE(created_by_principal_id::text, ''), created_at, last_used_at, revoked_at, COALESCE(revoked_by_principal_id::text, ''), COALESCE(revocation_reason, '')`
-	return scanPrincipalToken(cs.db.QueryRowContext(ctx, q, principalID, tokenPrefix, tokenHash, strings.TrimSpace(params.Name), nullableID(params.CreatedByPrincipalID)))
+	token, err := scanPrincipalToken(cs.db.QueryRowContext(ctx, q, principalID, tokenPrefix, tokenHash, strings.TrimSpace(params.Name), nullableID(params.CreatedByPrincipalID)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrincipalToken{}, cs.principalTokenTargetError(ctx, principalID)
+	}
+	return token, err
+}
+
+func (cs *CloudStore) principalTokenTargetError(ctx context.Context, principalID string) error {
+	var enabled bool
+	err := cs.db.QueryRowContext(ctx, `SELECT enabled FROM cloud_principals WHERE id = $1`, strings.TrimSpace(principalID)).Scan(&enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrPrincipalNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("cloudstore: read token principal: %w", err)
+	}
+	if !enabled {
+		return ErrPrincipalDisabled
+	}
+	return fmt.Errorf("cloudstore: token principal is unavailable")
 }
 
 func (cs *CloudStore) ListPrincipalTokens(ctx context.Context, principalID string) ([]PrincipalToken, error) {

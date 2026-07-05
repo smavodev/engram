@@ -279,22 +279,17 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 	// unknown/stale principalID silently mint and persist a real token
 	// against a principal that does not exist, then render a blank-username
 	// show-once page for it.
-	users, err := store.ListHumanUsers(r.Context())
+	user, found, err := findManagedUserByPrincipalID(r.Context(), store, principalID)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("list users: %v", err), http.StatusInternalServerError)
 		return
 	}
-	var user cloudstore.HumanUser
-	found := false
-	for _, u := range users {
-		if u.PrincipalID == principalID {
-			user = u
-			found = true
-			break
-		}
-	}
 	if !found {
 		http.Error(w, "managed user not found", http.StatusNotFound)
+		return
+	}
+	if !user.Enabled {
+		http.Error(w, disabledManagedUserTokenMessage(principalID), http.StatusConflict)
 		return
 	}
 	managedToken, err := cloudauth.GenerateManagedToken("live")
@@ -315,6 +310,14 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		CreatedByPrincipalID: actor.ID,
 	})
 	if err != nil {
+		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
+			http.Error(w, disabledManagedUserTokenMessage(principalID), http.StatusConflict)
+			return
+		}
+		if errors.Is(err, cloudstore.ErrPrincipalNotFound) {
+			http.Error(w, "managed user not found", http.StatusNotFound)
+			return
+		}
 		http.Error(w, fmt.Sprintf("create token: %v", err), http.StatusBadRequest)
 		return
 	}
