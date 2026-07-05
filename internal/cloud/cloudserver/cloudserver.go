@@ -2,7 +2,6 @@ package cloudserver
 
 import (
 	"context"
-	"crypto/hmac"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,18 +67,22 @@ type staticStatusProvider struct{ status dashboard.SyncStatus }
 func (s staticStatusProvider) Status() dashboard.SyncStatus { return s.status }
 
 type CloudServer struct {
-	store            ChunkStore
-	auth             Authenticator
-	principalAuth    principalResolver
-	projectAuth      ProjectAuthorizer
-	principalProject PrincipalProjectAuthorizer
-	dashboardAdmin   string
-	port             int
-	host             string
-	maxPushBodyBytes int64
-	mux              *http.ServeMux
-	syncStatus       dashboard.SyncStatusProvider
-	listenAndServe   func(addr string, handler http.Handler) error
+	store               ChunkStore
+	auth                Authenticator
+	principalAuth       principalResolver
+	projectAuth         ProjectAuthorizer
+	principalProject    PrincipalProjectAuthorizer
+	principalState      principalStateStore
+	adminIdentity       AdminIdentityStore
+	managedHasher       *cloudauth.ManagedTokenHasher
+	dashboardSessionKey []byte
+	dashboardAdmin      string
+	port                int
+	host                string
+	maxPushBodyBytes    int64
+	mux                 *http.ServeMux
+	syncStatus          dashboard.SyncStatusProvider
+	listenAndServe      func(addr string, handler http.Handler) error
 }
 
 const defaultHost = "127.0.0.1"
@@ -110,6 +113,21 @@ func WithProjectAuthorizer(authorizer ProjectAuthorizer) Option {
 func WithPrincipalProjectAuthorizer(authorizer PrincipalProjectAuthorizer) Option {
 	return func(s *CloudServer) {
 		s.principalProject = authorizer
+	}
+}
+
+func WithAdminIdentityStore(store AdminIdentityStore) Option {
+	return func(s *CloudServer) {
+		s.adminIdentity = store
+		if state, ok := store.(principalStateStore); ok {
+			s.principalState = state
+		}
+	}
+}
+
+func WithManagedTokenHasher(hasher *cloudauth.ManagedTokenHasher) Option {
+	return func(s *CloudServer) {
+		s.managedHasher = hasher
 	}
 }
 
@@ -146,6 +164,9 @@ func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *Clo
 	}
 	if projectAuthorizer, ok := authSvc.(ProjectAuthorizer); ok {
 		s.projectAuth = projectAuthorizer
+	}
+	if principalState, ok := store.(principalStateStore); ok {
+		s.principalState = principalState
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -185,23 +206,13 @@ func (s *CloudServer) routes() {
 	if store, ok := s.store.(dashboard.DashboardStore); ok {
 		dashboardStore = store
 	}
-	validateLoginToken := func(token string) error {
-		token = strings.TrimSpace(token)
-		if token == "" {
-			return fmt.Errorf("bearer token is required")
-		}
-		if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && hmac.Equal([]byte(token), []byte(adminToken)) {
-			return nil
-		}
-		if s.auth == nil {
-			return nil
-		}
-		req, _ := http.NewRequest(http.MethodGet, "/dashboard/login", nil)
-		req.Header.Set("Authorization", "Bearer "+token)
-		return s.auth.Authorize(req)
+	var managedUsersStore dashboard.ManagedUsersStore
+	if s.adminIdentity != nil {
+		managedUsersStore = s.adminIdentity
 	}
+	validateLoginToken := s.validateDashboardLoginToken
 	createSessionCookie := func(w http.ResponseWriter, r *http.Request, token string) error {
-		sessionToken, err := s.dashboardSessionToken(token)
+		sessionToken, err := s.dashboardSessionTokenForRequest(r.Context(), token)
 		if err != nil {
 			return err
 		}
@@ -238,18 +249,46 @@ func (s *CloudServer) routes() {
 		IsAdmin: func(r *http.Request) bool {
 			return s.isDashboardAdmin(r)
 		},
-		// GetDisplayName: returns "OPERATOR" until the session codec surfaces a
-		// display name (out of scope for this change). Satisfies REQ-103 / AD-2.
-		GetDisplayName:    func(r *http.Request) string { return "OPERATOR" },
+		GetDisplayName: func(r *http.Request) string {
+			return s.dashboardDisplayName(r)
+		},
 		Store:             dashboardStore,
+		ManagedUsers:      managedUsersStore,
 		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
 		StatusProvider:    s.syncStatus,
 	})
+	s.mux.HandleFunc("GET /dashboard/bootstrap", s.handleDashboardBootstrapPage)
+	s.mux.HandleFunc("POST /dashboard/bootstrap", s.handleDashboardBootstrapSubmit)
+	// Dashboard-rendered Managed Users surface (cloud-user-token-management
+	// PR4). Registered directly on the mux (like /dashboard/bootstrap above)
+	// rather than through dashboard.Mount, because these mutation routes need
+	// the admin identity store, managed token hasher, and audit helpers that
+	// already live on CloudServer and are proven by admin_handlers.go's JSON
+	// /admin/* API — this is the same policy/store/audit path, not a
+	// re-decided one.
+	s.mux.HandleFunc("GET /dashboard/admin/users/{principalID}", s.requireDashboardSession(s.handleDashboardManagedUserDetail))
+	s.mux.HandleFunc("POST /dashboard/admin/users", s.requireDashboardSession(s.handleDashboardCreateManagedUser))
+	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/enable", s.requireDashboardSession(s.handleDashboardEnableManagedUser))
+	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/disable", s.requireDashboardSession(s.handleDashboardDisableManagedUser))
+	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/tokens", s.requireDashboardSession(s.handleDashboardCreateManagedToken))
+	s.mux.HandleFunc("POST /dashboard/admin/tokens/{tokenID}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedToken))
+	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants", s.requireDashboardSession(s.handleDashboardCreateManagedGrant))
+	s.mux.HandleFunc("POST /dashboard/admin/users/{principalID}/grants/{project}/revoke", s.requireDashboardSession(s.handleDashboardRevokeManagedGrant))
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
 	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
 	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
+	s.mux.HandleFunc("GET /admin/users", s.withAuth(s.handleAdminListUsers))
+	s.mux.HandleFunc("POST /admin/users", s.withAuth(s.handleAdminCreateUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/enable", s.withAuth(s.handleAdminEnableUser))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/disable", s.withAuth(s.handleAdminDisableUser))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminListTokens))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/tokens", s.withAuth(s.handleAdminCreateToken))
+	s.mux.HandleFunc("POST /admin/tokens/{tokenID}/revoke", s.withAuth(s.handleAdminRevokeToken))
+	s.mux.HandleFunc("GET /admin/users/{principalID}/grants", s.withAuth(s.handleAdminListGrants))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants", s.withAuth(s.handleAdminCreateGrant))
+	s.mux.HandleFunc("POST /admin/users/{principalID}/grants/{project}/revoke", s.withAuth(s.handleAdminRevokeGrant))
 }
 
 func (s *CloudServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -319,6 +358,10 @@ func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if principal, ok := s.dashboardPrincipalFromCookie(r.Context(), cookie.Value); ok {
+		*r = *r.WithContext(WithPrincipal(r.Context(), principal))
+		return nil
+	}
 	bearerToken, err := s.dashboardBearerToken(cookie.Value)
 	if err != nil {
 		return err
@@ -326,7 +369,7 @@ func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
 	if strings.TrimSpace(bearerToken) == "" {
 		return fmt.Errorf("dashboard session token is empty")
 	}
-	if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && hmac.Equal([]byte(bearerToken), []byte(adminToken)) {
+	if s.verifyLegacyDashboardAdminCookie(r) {
 		return nil
 	}
 	req, _ := http.NewRequest(http.MethodGet, "/dashboard", nil)
@@ -370,22 +413,10 @@ func (s *CloudServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *CloudServer) isDashboardAdmin(r *http.Request) bool {
-	if s.auth == nil {
-		return false
+	if principal, ok := s.dashboardPrincipalFromRequest(r); ok {
+		return principal.Role == cloudauth.RoleAdmin && (principal.Source == cloudauth.PrincipalSourceManagedToken || principal.Source == cloudauth.PrincipalSourceLegacyEnvAdmin)
 	}
-	adminToken := strings.TrimSpace(s.dashboardAdmin)
-	if adminToken == "" {
-		return false
-	}
-	cookie, err := r.Cookie(dashboardSessionCookieName)
-	if err != nil {
-		return false
-	}
-	token, err := s.dashboardBearerToken(cookie.Value)
-	if err != nil {
-		return false
-	}
-	return hmac.Equal([]byte(token), []byte(adminToken))
+	return s.verifyLegacyDashboardAdminCookie(r)
 }
 
 func (s *CloudServer) handlePullManifest(w http.ResponseWriter, r *http.Request) {
