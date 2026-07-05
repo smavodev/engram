@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,7 +103,32 @@ func (s *adminTestStore) CreatePrincipalToken(_ context.Context, params cloudsto
 	if s.createTokenErr != nil {
 		return cloudstore.PrincipalToken{}, s.createTokenErr
 	}
-	token := cloudstore.PrincipalToken{
+	token := s.principalTokenFromParams(params)
+	s.tokens = append(s.tokens, token)
+	return token, nil
+}
+
+func (s *adminTestStore) CreatePrincipalTokenWithAudit(_ context.Context, params cloudstore.CreatePrincipalTokenParams, audit cloudstore.AuthAuditEvent) (cloudstore.PrincipalToken, error) {
+	s.createTokenCalls++
+	if s.createTokenErr != nil {
+		return cloudstore.PrincipalToken{}, s.createTokenErr
+	}
+	if s.auditErr != nil {
+		return cloudstore.PrincipalToken{}, fmt.Errorf("%w: %w", cloudstore.ErrAuthAuditInsertFailed, s.auditErr)
+	}
+	if strings.TrimSpace(audit.ActorSource) == "" {
+		return cloudstore.PrincipalToken{}, fmt.Errorf("%w: actor source is required", cloudstore.ErrAuthAuditInsertFailed)
+	}
+	token := s.principalTokenFromParams(params)
+	s.auditMu.Lock()
+	s.auditEvents = append(s.auditEvents, audit)
+	s.auditMu.Unlock()
+	s.tokens = append(s.tokens, token)
+	return token, nil
+}
+
+func (s *adminTestStore) principalTokenFromParams(params cloudstore.CreatePrincipalTokenParams) cloudstore.PrincipalToken {
+	return cloudstore.PrincipalToken{
 		ID:                   "tok-" + params.PrincipalID,
 		PrincipalID:          strings.TrimSpace(params.PrincipalID),
 		TokenPrefix:          strings.TrimSpace(params.TokenPrefix),
@@ -111,8 +137,6 @@ func (s *adminTestStore) CreatePrincipalToken(_ context.Context, params cloudsto
 		CreatedByPrincipalID: strings.TrimSpace(params.CreatedByPrincipalID),
 		CreatedAt:            time.Date(2026, 7, 3, 12, 1, 0, 0, time.UTC),
 	}
-	s.tokens = append(s.tokens, token)
-	return token, nil
 }
 
 func (s *adminTestStore) ListPrincipalTokens(_ context.Context, principalID string) ([]cloudstore.PrincipalToken, error) {
@@ -517,6 +541,37 @@ func TestAdminCreateTokenStoreNotFoundRaceReturns404WithoutPersistingOrAuditing(
 	for _, event := range store.auditEvents {
 		if event.Action == authAuditActionTokenCreate {
 			t.Fatalf("store-level not-found rejection must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
+func TestAdminCreateTokenAuditFailureRollsBackTokenAndDoesNotReturnRawToken(t *testing.T) {
+	admin := cloudauth.Principal{ID: "p-admin", Kind: cloudauth.PrincipalKindHuman, Role: cloudauth.RoleAdmin, Source: cloudauth.PrincipalSourceManagedToken, Enabled: true}
+	store := newAdminTestStore()
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-target", Username: "target", DisplayName: "Target", Role: "member", Enabled: true})
+	store.auditErr = errors.New("audit unavailable")
+	srv := adminHandlerTestServer(t, admin, store)
+
+	rec := performAdminRequest(srv, http.MethodPost, "/admin/users/p-target/tokens", `{"name":"laptop"}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected audit failure to fail token creation, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "raw_token") || strings.Contains(body, "egc_live_") {
+		t.Fatalf("audit failure must not expose show-once token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected atomic token create to be attempted once, got %d calls", store.createTokenCalls)
+	}
+	if store.revokeTokenCalls != 0 {
+		t.Fatalf("token audit atomicity must not rely on compensation revoke, got %d revoke calls", store.revokeTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("audit failure must roll back token persistence, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("audit failure must not record token.create success audit, got %+v", event)
 		}
 	}
 }

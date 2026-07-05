@@ -302,13 +302,16 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 		http.Error(w, fmt.Sprintf("hash token: %v", err), http.StatusInternalServerError)
 		return
 	}
-	token, err := store.CreatePrincipalToken(r.Context(), cloudstore.CreatePrincipalTokenParams{
-		PrincipalID:          principalID,
-		TokenPrefix:          managedToken.Prefix,
-		TokenHash:            tokenHash,
-		Name:                 name,
-		CreatedByPrincipalID: actor.ID,
-	})
+	token, err := store.CreatePrincipalTokenWithAudit(r.Context(),
+		cloudstore.CreatePrincipalTokenParams{
+			PrincipalID:          principalID,
+			TokenPrefix:          managedToken.Prefix,
+			TokenHash:            tokenHash,
+			Name:                 name,
+			CreatedByPrincipalID: actor.ID,
+		},
+		adminAuditEvent(actor, authAuditActionTokenCreate, principalID, "", map[string]any{"token_prefix": managedToken.Prefix, "name": name}),
+	)
 	if err != nil {
 		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
 			s.renderDashboardManagedTokenDisabled(w, r, user)
@@ -318,11 +321,11 @@ func (s *CloudServer) handleDashboardCreateManagedToken(w http.ResponseWriter, r
 			http.Error(w, "managed user not found", http.StatusNotFound)
 			return
 		}
+		if errors.Is(err, cloudstore.ErrAuthAuditInsertFailed) {
+			http.Error(w, fmt.Sprintf("record audit: %v", err), http.StatusInternalServerError)
+			return
+		}
 		http.Error(w, fmt.Sprintf("create token: %v", err), http.StatusBadRequest)
-		return
-	}
-	if err := s.recordAdminAudit(r.Context(), store, actor, authAuditActionTokenCreate, principalID, "", map[string]any{"token_prefix": managedToken.Prefix, "name": name}); err != nil {
-		http.Error(w, fmt.Sprintf("record audit: %v", err), http.StatusInternalServerError)
 		return
 	}
 	renderDashboardAdminComponent(w, r, s.dashboardAdminLayout(r, "Token Created", dashboard.ManagedUserTokenCreatedPage(user, managedToken.Raw, sanitizeTokenForDisplay(token))))

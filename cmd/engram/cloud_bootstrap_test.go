@@ -25,6 +25,7 @@ type fakeCloudBootstrapStore struct {
 	createGrantErr error
 	createTokenErr error
 	auditErr       error
+	auditErrOnCall int
 
 	users       []cloudstore.HumanUser
 	grants      []cloudstore.ProjectGrant
@@ -35,6 +36,7 @@ type fakeCloudBootstrapStore struct {
 	createGrantCalls      int
 	createTokenCalls      int
 	createFirstAdminCalls int
+	auditCalls            int
 	closeCalls            int
 
 	// createFirstAdminMu guards CreateFirstAdminHumanUser's check-then-create
@@ -110,7 +112,26 @@ func (s *fakeCloudBootstrapStore) CreatePrincipalToken(_ context.Context, params
 	if s.createTokenErr != nil {
 		return cloudstore.PrincipalToken{}, s.createTokenErr
 	}
-	token := cloudstore.PrincipalToken{
+	token := fakePrincipalToken(params)
+	s.tokens = append(s.tokens, token)
+	return token, nil
+}
+
+func (s *fakeCloudBootstrapStore) CreatePrincipalTokenWithAudit(_ context.Context, params cloudstore.CreatePrincipalTokenParams, audit cloudstore.AuthAuditEvent) (cloudstore.PrincipalToken, error) {
+	s.createTokenCalls++
+	if s.createTokenErr != nil {
+		return cloudstore.PrincipalToken{}, s.createTokenErr
+	}
+	token := fakePrincipalToken(params)
+	if err := s.insertAuthAuditEvent(audit); err != nil {
+		return cloudstore.PrincipalToken{}, err
+	}
+	s.tokens = append(s.tokens, token)
+	return token, nil
+}
+
+func fakePrincipalToken(params cloudstore.CreatePrincipalTokenParams) cloudstore.PrincipalToken {
+	return cloudstore.PrincipalToken{
 		ID:                   "tok-" + params.PrincipalID,
 		PrincipalID:          params.PrincipalID,
 		TokenPrefix:          params.TokenPrefix,
@@ -118,8 +139,6 @@ func (s *fakeCloudBootstrapStore) CreatePrincipalToken(_ context.Context, params
 		Name:                 params.Name,
 		CreatedByPrincipalID: params.CreatedByPrincipalID,
 	}
-	s.tokens = append(s.tokens, token)
-	return token, nil
 }
 
 func (s *fakeCloudBootstrapStore) CreateProjectGrant(_ context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error) {
@@ -137,8 +156,16 @@ func (s *fakeCloudBootstrapStore) CreateProjectGrant(_ context.Context, params c
 }
 
 func (s *fakeCloudBootstrapStore) InsertAuthAuditEvent(_ context.Context, event cloudstore.AuthAuditEvent) error {
+	return s.insertAuthAuditEvent(event)
+}
+
+func (s *fakeCloudBootstrapStore) insertAuthAuditEvent(event cloudstore.AuthAuditEvent) error {
+	s.auditCalls++
 	if s.auditErr != nil {
 		return s.auditErr
+	}
+	if s.auditErrOnCall > 0 && s.auditCalls == s.auditErrOnCall {
+		return errNewCloudBootstrapFixture("audit store unavailable on configured call")
 	}
 	if strings.TrimSpace(event.ActorSource) == "" {
 		return errActorSourceRequiredFixture
@@ -372,6 +399,39 @@ func TestCloudBootstrapAdminTokenCreateFailureAuditsAdminCreationAndFailure(t *t
 	failureEvent := store.auditEvents[1]
 	if failureEvent.Outcome != cloudBootstrapAuditOutcomeError {
 		t.Fatalf("expected a distinct failure audit event for the token failure, got %+v", failureEvent)
+	}
+}
+
+// TestCloudBootstrapAdminTokenAuditFailureDoesNotPersistOrDiscloseRawToken
+// proves the token+audit atomicity contract for bootstrap --issue-token: when
+// the completion audit fails after token generation, the command exits non-zero,
+// no raw token is printed, and no managed token is persisted.
+func TestCloudBootstrapAdminTokenAuditFailureDoesNotPersistOrDiscloseRawToken(t *testing.T) {
+	stubExitWithPanic(t)
+	t.Setenv("ENGRAM_CLOUD_TOKEN_PEPPER", "dedicated-cloud-token-pepper-for-tests")
+	store := &fakeCloudBootstrapStore{auditErrOnCall: 2}
+	stubNewCloudBootstrapStore(t, store)
+
+	withArgs(t, "engram", "cloud", "bootstrap", "admin", "--username", "lena", "--issue-token")
+	stdout, stderr, recovered := captureOutputAndRecover(t, cmdCloudBootstrap)
+
+	code, ok := recovered.(exitCode)
+	if !ok || int(code) != 1 {
+		t.Fatalf("expected exit code 1 when token audit fails, got recovered=%v stderr=%q", recovered, stderr)
+	}
+	if strings.Contains(stdout, "egc_live_") {
+		t.Fatalf("expected no raw token to be printed when token audit fails, got stdout=%q", stdout)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("expected no token to be persisted when token audit fails, got %+v", store.tokens)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected exactly one atomic token issuance attempt, got %d", store.createTokenCalls)
+	}
+	for _, event := range store.auditEvents {
+		if event.Outcome == cloudBootstrapAuditOutcomeSuccess && event.ReasonCode == "bootstrap_completed" {
+			t.Fatalf("expected no durable token completion audit when atomic token audit fails, got %+v", event)
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ var (
 	ErrInvalidPrincipalRole   = errors.New("cloudstore: invalid principal role")
 	ErrLastActiveAdmin        = errors.New("cloudstore: cannot remove last active admin")
 	ErrSensitiveAuditMetadata = errors.New("cloudstore: sensitive auth audit metadata is not allowed")
+	ErrAuthAuditInsertFailed  = errors.New("cloudstore: auth audit insert failed")
 	ErrAdminAlreadyExists     = errors.New("cloudstore: a managed admin already exists")
 	ErrPrincipalNotFound      = errors.New("cloudstore: principal not found")
 	ErrPrincipalDisabled      = errors.New("cloudstore: principal is disabled")
@@ -400,17 +401,9 @@ func (cs *CloudStore) CreatePrincipalToken(ctx context.Context, params CreatePri
 	if cs == nil || cs.db == nil {
 		return PrincipalToken{}, fmt.Errorf("cloudstore: not initialized")
 	}
-	principalID := strings.TrimSpace(params.PrincipalID)
-	if principalID == "" {
-		return PrincipalToken{}, fmt.Errorf("cloudstore: principal id is required")
-	}
-	tokenPrefix := strings.TrimSpace(params.TokenPrefix)
-	if tokenPrefix == "" {
-		return PrincipalToken{}, fmt.Errorf("cloudstore: token prefix is required")
-	}
-	tokenHash := strings.TrimSpace(params.TokenHash)
-	if tokenHash == "" {
-		return PrincipalToken{}, fmt.Errorf("cloudstore: token hash is required")
+	values, err := normalizeCreatePrincipalTokenParams(params)
+	if err != nil {
+		return PrincipalToken{}, err
 	}
 	const q = `
 		WITH target_principal AS (
@@ -423,16 +416,91 @@ func (cs *CloudStore) CreatePrincipalToken(ctx context.Context, params CreatePri
 		SELECT p.id, $2, $3, $4, $5
 		FROM target_principal p
 		RETURNING id::text, principal_id::text, token_prefix, '' AS token_hash, name, COALESCE(created_by_principal_id::text, ''), created_at, last_used_at, revoked_at, COALESCE(revoked_by_principal_id::text, ''), COALESCE(revocation_reason, '')`
-	token, err := scanPrincipalToken(cs.db.QueryRowContext(ctx, q, principalID, tokenPrefix, tokenHash, strings.TrimSpace(params.Name), nullableID(params.CreatedByPrincipalID)))
+	token, err := scanPrincipalToken(cs.db.QueryRowContext(ctx, q, values.principalID, values.tokenPrefix, values.tokenHash, values.name, values.createdByPrincipalID))
 	if errors.Is(err, sql.ErrNoRows) {
-		return PrincipalToken{}, cs.principalTokenTargetError(ctx, principalID)
+		return PrincipalToken{}, principalTokenTargetError(ctx, cs.db, values.principalID)
 	}
 	return token, err
 }
 
-func (cs *CloudStore) principalTokenTargetError(ctx context.Context, principalID string) error {
+func (cs *CloudStore) CreatePrincipalTokenWithAudit(ctx context.Context, params CreatePrincipalTokenParams, audit AuthAuditEvent) (PrincipalToken, error) {
+	if cs == nil || cs.db == nil {
+		return PrincipalToken{}, fmt.Errorf("cloudstore: not initialized")
+	}
+	values, err := normalizeCreatePrincipalTokenParams(params)
+	if err != nil {
+		return PrincipalToken{}, err
+	}
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PrincipalToken{}, fmt.Errorf("cloudstore: begin principal token audit tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const q = `
+		WITH target_principal AS (
+			SELECT id
+			FROM cloud_principals
+			WHERE id = $1 AND enabled = TRUE
+			FOR UPDATE
+		)
+		INSERT INTO cloud_principal_tokens (principal_id, token_prefix, token_hash, name, created_by_principal_id)
+		SELECT p.id, $2, $3, $4, $5
+		FROM target_principal p
+		RETURNING id::text, principal_id::text, token_prefix, '' AS token_hash, name, COALESCE(created_by_principal_id::text, ''), created_at, last_used_at, revoked_at, COALESCE(revoked_by_principal_id::text, ''), COALESCE(revocation_reason, '')`
+	token, err := scanPrincipalToken(tx.QueryRowContext(ctx, q, values.principalID, values.tokenPrefix, values.tokenHash, values.name, values.createdByPrincipalID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PrincipalToken{}, principalTokenTargetError(ctx, tx, values.principalID)
+	}
+	if err != nil {
+		return PrincipalToken{}, err
+	}
+	if err := insertAuthAuditEvent(ctx, tx, audit); err != nil {
+		return PrincipalToken{}, fmt.Errorf("%w: %w", ErrAuthAuditInsertFailed, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return PrincipalToken{}, fmt.Errorf("cloudstore: commit principal token audit tx: %w", err)
+	}
+	return token, nil
+}
+
+type createPrincipalTokenValues struct {
+	principalID          string
+	tokenPrefix          string
+	tokenHash            string
+	name                 string
+	createdByPrincipalID any
+}
+
+func normalizeCreatePrincipalTokenParams(params CreatePrincipalTokenParams) (createPrincipalTokenValues, error) {
+	principalID := strings.TrimSpace(params.PrincipalID)
+	if principalID == "" {
+		return createPrincipalTokenValues{}, fmt.Errorf("cloudstore: principal id is required")
+	}
+	tokenPrefix := strings.TrimSpace(params.TokenPrefix)
+	if tokenPrefix == "" {
+		return createPrincipalTokenValues{}, fmt.Errorf("cloudstore: token prefix is required")
+	}
+	tokenHash := strings.TrimSpace(params.TokenHash)
+	if tokenHash == "" {
+		return createPrincipalTokenValues{}, fmt.Errorf("cloudstore: token hash is required")
+	}
+	return createPrincipalTokenValues{
+		principalID:          principalID,
+		tokenPrefix:          tokenPrefix,
+		tokenHash:            tokenHash,
+		name:                 strings.TrimSpace(params.Name),
+		createdByPrincipalID: nullableID(params.CreatedByPrincipalID),
+	}, nil
+}
+
+type principalTokenTargetQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func principalTokenTargetError(ctx context.Context, queryer principalTokenTargetQueryer, principalID string) error {
 	var enabled bool
-	err := cs.db.QueryRowContext(ctx, `SELECT enabled FROM cloud_principals WHERE id = $1`, strings.TrimSpace(principalID)).Scan(&enabled)
+	err := queryer.QueryRowContext(ctx, `SELECT enabled FROM cloud_principals WHERE id = $1`, strings.TrimSpace(principalID)).Scan(&enabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrPrincipalNotFound
 	}
@@ -630,6 +698,14 @@ func (cs *CloudStore) InsertAuthAuditEvent(ctx context.Context, event AuthAuditE
 	if cs == nil || cs.db == nil {
 		return fmt.Errorf("cloudstore: not initialized")
 	}
+	return insertAuthAuditEvent(ctx, cs.db, event)
+}
+
+type authAuditEventExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertAuthAuditEvent(ctx context.Context, exec authAuditEventExecutor, event AuthAuditEvent) error {
 	actorSource := strings.TrimSpace(event.ActorSource)
 	if actorSource == "" {
 		return fmt.Errorf("cloudstore: actor source is required")
@@ -646,7 +722,7 @@ func (cs *CloudStore) InsertAuthAuditEvent(ctx context.Context, event AuthAuditE
 	if err != nil {
 		return err
 	}
-	_, err = cs.db.ExecContext(ctx, `
+	_, err = exec.ExecContext(ctx, `
 		INSERT INTO cloud_auth_audit_log (actor_principal_id, actor_source, target_principal_id, project, action, outcome, reason_code, metadata)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, nullableID(event.ActorPrincipalID), actorSource, nullableID(event.TargetPrincipalID), nullableText(event.Project), action, outcome, nullableText(event.ReasonCode), metadata)
 	if err != nil {

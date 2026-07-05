@@ -233,6 +233,44 @@ func TestCreatePrincipalTokenRejectsDisabledPrincipalWithoutPersisting(t *testin
 	}
 }
 
+func TestCreatePrincipalTokenWithAuditRollsBackTokenWhenAuditValidationFails(t *testing.T) {
+	ctx := context.Background()
+	cs := openIsolatedCloudStore(t)
+
+	actor, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "audit-actor", Email: "audit-actor@example.test", DisplayName: "Audit Actor", Role: PrincipalRoleAdmin})
+	if err != nil {
+		t.Fatalf("CreateHumanUser actor: %v", err)
+	}
+	target, err := cs.CreateHumanUser(ctx, CreateHumanUserParams{Username: "audit-target", Email: "audit-target@example.test", DisplayName: "Audit Target", Role: PrincipalRoleMember})
+	if err != nil {
+		t.Fatalf("CreateHumanUser target: %v", err)
+	}
+
+	_, err = cs.CreatePrincipalTokenWithAudit(ctx,
+		CreatePrincipalTokenParams{PrincipalID: target.PrincipalID, TokenPrefix: "egc_live_atomic", TokenHash: "hmac-sha256:v1:atomic-rollback", Name: "laptop", CreatedByPrincipalID: actor.PrincipalID},
+		AuthAuditEvent{ActorPrincipalID: actor.PrincipalID, ActorSource: "managed", TargetPrincipalID: target.PrincipalID, Action: "token.create", Outcome: "success", Metadata: map[string]any{"raw_token": "egc_live_secret"}},
+	)
+	if !errors.Is(err, ErrSensitiveAuditMetadata) {
+		t.Fatalf("expected sensitive audit metadata validation error, got %v", err)
+	}
+	tokens, err := cs.ListPrincipalTokens(ctx, target.PrincipalID)
+	if err != nil {
+		t.Fatalf("ListPrincipalTokens after failed atomic create: %v", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("atomic audit failure must roll back token insert, got %+v", tokens)
+	}
+	events, err := cs.ListAuthAuditEvents(ctx, AuthAuditQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListAuthAuditEvents after failed atomic create: %v", err)
+	}
+	for _, event := range events {
+		if event.Action == "token.create" {
+			t.Fatalf("failed atomic create must not persist token.create audit, got %+v", event)
+		}
+	}
+}
+
 // TestFindPrincipalTokenByHashResolvesActiveTokenAndRejectsUnknownOrRevoked
 // is the RED-first proof for the runtime managed-token wiring slice: before
 // FindPrincipalTokenByHash existed, this test failed to compile (undefined

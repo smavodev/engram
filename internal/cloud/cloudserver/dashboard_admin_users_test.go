@@ -523,6 +523,35 @@ func TestDashboardCreateManagedTokenStoreNotFoundRaceReturns404WithoutPersisting
 	}
 }
 
+func TestDashboardCreateManagedTokenAuditFailureRollsBackTokenAndDoesNotRenderRawToken(t *testing.T) {
+	srv, store, cookie := dashboardAdminUsersTestServer(t)
+	store.users = append(store.users, cloudstore.HumanUser{PrincipalID: "p-target", Username: "target", Role: "member", Enabled: true})
+	store.auditErr = errors.New("audit unavailable")
+
+	rec := performDashboardForm(srv, http.MethodPost, "/dashboard/admin/users/p-target/tokens", "name=laptop", cookie, false)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected audit failure to fail token creation, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "egc_live_") || strings.Contains(body, "token-reveal") {
+		t.Fatalf("audit failure must not render show-once token material, body=%q", body)
+	}
+	if store.createTokenCalls != 1 {
+		t.Fatalf("expected atomic token create to be attempted once, got %d calls", store.createTokenCalls)
+	}
+	if store.revokeTokenCalls != 0 {
+		t.Fatalf("token audit atomicity must not rely on compensation revoke, got %d revoke calls", store.revokeTokenCalls)
+	}
+	if len(store.tokens) != 0 {
+		t.Fatalf("audit failure must roll back token persistence, got %+v", store.tokens)
+	}
+	for _, event := range store.auditEvents {
+		if event.Action == authAuditActionTokenCreate {
+			t.Fatalf("audit failure must not record token.create success audit, got %+v", event)
+		}
+	}
+}
+
 // TestDashboardDisableManagedUserSurfacesStoreErrorWithoutAudit is part of
 // FIX C: a generic store failure on disable must surface as an error
 // response (not 200/303) with no user.disable success audit recorded.

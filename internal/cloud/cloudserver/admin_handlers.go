@@ -34,7 +34,7 @@ type AdminIdentityStore interface {
 	CreateHumanUser(ctx context.Context, params cloudstore.CreateHumanUserParams) (cloudstore.HumanUser, error)
 	ListHumanUsers(ctx context.Context) ([]cloudstore.HumanUser, error)
 	SetHumanUserEnabled(ctx context.Context, principalID string, enabled bool) error
-	CreatePrincipalToken(ctx context.Context, params cloudstore.CreatePrincipalTokenParams) (cloudstore.PrincipalToken, error)
+	CreatePrincipalTokenWithAudit(ctx context.Context, params cloudstore.CreatePrincipalTokenParams, audit cloudstore.AuthAuditEvent) (cloudstore.PrincipalToken, error)
 	ListPrincipalTokens(ctx context.Context, principalID string) ([]cloudstore.PrincipalToken, error)
 	RevokePrincipalToken(ctx context.Context, tokenID, revokedByPrincipalID, reason string) error
 	CreateProjectGrant(ctx context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error)
@@ -218,7 +218,10 @@ func (s *CloudServer) handleAdminCreateToken(w http.ResponseWriter, r *http.Requ
 		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("hash token: %v", err))
 		return
 	}
-	token, err := store.CreatePrincipalToken(r.Context(), cloudstore.CreatePrincipalTokenParams{PrincipalID: principalID, TokenPrefix: managedToken.Prefix, TokenHash: tokenHash, Name: req.Name, CreatedByPrincipalID: actor.ID})
+	token, err := store.CreatePrincipalTokenWithAudit(r.Context(),
+		cloudstore.CreatePrincipalTokenParams{PrincipalID: principalID, TokenPrefix: managedToken.Prefix, TokenHash: tokenHash, Name: req.Name, CreatedByPrincipalID: actor.ID},
+		adminAuditEvent(actor, authAuditActionTokenCreate, principalID, "", map[string]any{"token_prefix": managedToken.Prefix, "name": strings.TrimSpace(req.Name)}),
+	)
 	if err != nil {
 		if errors.Is(err, cloudstore.ErrPrincipalDisabled) {
 			writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, disabledManagedUserTokenMessage(principalID))
@@ -228,11 +231,11 @@ func (s *CloudServer) handleAdminCreateToken(w http.ResponseWriter, r *http.Requ
 			writeActionableError(w, http.StatusNotFound, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "managed user not found")
 			return
 		}
+		if errors.Is(err, cloudstore.ErrAuthAuditInsertFailed) {
+			writeAuditFailure(w, err)
+			return
+		}
 		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("create token: %v", err))
-		return
-	}
-	if err := s.recordAdminAudit(r.Context(), store, actor, authAuditActionTokenCreate, principalID, "", map[string]any{"token_prefix": managedToken.Prefix, "name": strings.TrimSpace(req.Name)}); err != nil {
-		writeAuditFailure(w, err)
 		return
 	}
 	jsonResponse(w, http.StatusCreated, map[string]any{"raw_token": managedToken.Raw, "token": sanitizeToken(token)})
@@ -386,7 +389,11 @@ func (s *CloudServer) adminStore(w http.ResponseWriter) (AdminIdentityStore, boo
 }
 
 func (s *CloudServer) recordAdminAudit(ctx context.Context, store AdminIdentityStore, actor cloudauth.Principal, action, targetPrincipalID, project string, metadata map[string]any) error {
-	return store.InsertAuthAuditEvent(ctx, cloudstore.AuthAuditEvent{
+	return store.InsertAuthAuditEvent(ctx, adminAuditEvent(actor, action, targetPrincipalID, project, metadata))
+}
+
+func adminAuditEvent(actor cloudauth.Principal, action, targetPrincipalID, project string, metadata map[string]any) cloudstore.AuthAuditEvent {
+	return cloudstore.AuthAuditEvent{
 		ActorPrincipalID:  strings.TrimSpace(actor.ID),
 		ActorSource:       string(actor.Source),
 		TargetPrincipalID: strings.TrimSpace(targetPrincipalID),
@@ -394,7 +401,7 @@ func (s *CloudServer) recordAdminAudit(ctx context.Context, store AdminIdentityS
 		Action:            strings.TrimSpace(action),
 		Outcome:           authAuditOutcomeSuccess,
 		Metadata:          metadata,
-	})
+	}
 }
 
 func writeAuditFailure(w http.ResponseWriter, err error) {

@@ -43,7 +43,7 @@ const (
 // both observe "no active admin" and both create a first admin.
 type cloudBootstrapStore interface {
 	CreateFirstAdminHumanUser(ctx context.Context, params cloudstore.CreateHumanUserParams) (cloudstore.HumanUser, error)
-	CreatePrincipalToken(ctx context.Context, params cloudstore.CreatePrincipalTokenParams) (cloudstore.PrincipalToken, error)
+	CreatePrincipalTokenWithAudit(ctx context.Context, params cloudstore.CreatePrincipalTokenParams, audit cloudstore.AuthAuditEvent) (cloudstore.PrincipalToken, error)
 	CreateProjectGrant(ctx context.Context, params cloudstore.CreateProjectGrantParams) (cloudstore.ProjectGrant, error)
 	InsertAuthAuditEvent(ctx context.Context, event cloudstore.AuthAuditEvent) error
 	Close() error
@@ -187,7 +187,6 @@ func cmdCloudBootstrapAdmin() {
 	}
 
 	var rawToken string
-	var issuedToken cloudstore.PrincipalToken
 	if args.issueToken {
 		managedToken, terr := cloudauth.GenerateManagedToken("live")
 		if terr != nil {
@@ -205,21 +204,31 @@ func cmdCloudBootstrapAdmin() {
 		if name == "" {
 			name = "cli-bootstrap"
 		}
-		token, terr := cs.CreatePrincipalToken(ctx, cloudstore.CreatePrincipalTokenParams{
+		metadata := cloudBootstrapCompletionMetadata(args.username, args.issueToken, grants)
+		metadata["token_prefix"] = managedToken.Prefix
+		_, createTokenErr := cs.CreatePrincipalTokenWithAudit(ctx, cloudstore.CreatePrincipalTokenParams{
 			PrincipalID:          user.PrincipalID,
 			TokenPrefix:          managedToken.Prefix,
 			TokenHash:            tokenHash,
 			Name:                 name,
 			CreatedByPrincipalID: user.PrincipalID,
+		}, cloudstore.AuthAuditEvent{
+			ActorSource:       string(cloudauth.PrincipalSourceBootstrapCLI),
+			TargetPrincipalID: strings.TrimSpace(user.PrincipalID),
+			Action:            cloudBootstrapAuditAction,
+			Outcome:           cloudBootstrapAuditOutcomeSuccess,
+			ReasonCode:        "bootstrap_completed",
+			Metadata:          metadata,
 		})
-		if terr != nil {
-			// No token was durably minted: nothing to print, nothing leaked.
-			recordCloudBootstrapAuditBestEffort(ctx, cs, user.PrincipalID, cloudBootstrapAuditOutcomeError, "token_create_failed", map[string]any{"created_admin": true, "username": args.username, "failed_step": "issue_token"})
-			fatal(fmt.Errorf("cloud bootstrap admin: create token: %w", terr))
+		if createTokenErr != nil {
+			// The managed token and its success/completion audit are one atomic
+			// unit: if either write fails, nothing is durably minted and nothing is
+			// safe to disclose.
+			recordCloudBootstrapAuditBestEffort(ctx, cs, user.PrincipalID, cloudBootstrapAuditOutcomeError, "token_create_or_audit_failed", map[string]any{"created_admin": true, "username": args.username, "failed_step": "issue_token"})
+			fatal(fmt.Errorf("cloud bootstrap admin: create token with completion audit: %w", createTokenErr))
 			return
 		}
 		rawToken = managedToken.Raw
-		issuedToken = token
 	}
 
 	fmt.Printf("✓ Managed admin created: username=%s principal_id=%s\n", user.Username, user.PrincipalID)
@@ -229,43 +238,36 @@ func cmdCloudBootstrapAdmin() {
 	if args.issueToken {
 		fmt.Println()
 		fmt.Println("Token issued — SHOWN ONCE, copy and store it now, it cannot be retrieved again:")
-		// Print BEFORE the completion-detail audit write below, so an
-		// operator always sees a successfully-minted token even if that
-		// audit insert then fails (the token/admin are already durably
-		// created and the admin's own creation is already durably audited
-		// above, regardless of what happens next).
 		fmt.Println(rawToken)
 	}
 
-	// Completion-detail audit: only written when there is more to report
-	// than the mandatory admin-creation event above already captured
-	// (grants and/or an issued token). Still fail closed (per the
-	// mutation-then-audit-then-fail convention): a failure here is itself
-	// one of the "optional steps after admin creation" this fix protects
-	// against, so it gets its own compensating best-effort audit event and a
-	// non-zero exit rather than a silent success.
-	if len(grants) > 0 || args.issueToken {
-		metadata := map[string]any{
-			"created_admin": true,
-			"username":      args.username,
-			"issued_token":  args.issueToken,
-		}
-		if len(grants) > 0 {
-			projects := make([]string, 0, len(grants))
-			for _, g := range grants {
-				projects = append(projects, g.Project)
-			}
-			metadata["grant_projects"] = projects
-		}
-		if args.issueToken {
-			metadata["token_prefix"] = issuedToken.TokenPrefix
-		}
+	// Completion-detail audit for grant-only bootstraps. Token bootstraps record
+	// this same success/completion audit atomically with token persistence above,
+	// before the raw token is disclosed.
+	if len(grants) > 0 && !args.issueToken {
+		metadata := cloudBootstrapCompletionMetadata(args.username, args.issueToken, grants)
 		if err := recordCloudBootstrapAudit(ctx, cs, user.PrincipalID, cloudBootstrapAuditOutcomeSuccess, "bootstrap_completed", metadata); err != nil {
 			recordCloudBootstrapAuditBestEffort(ctx, cs, user.PrincipalID, cloudBootstrapAuditOutcomeError, "completion_audit_failed", map[string]any{"created_admin": true, "username": args.username})
 			fatal(fmt.Errorf("cloud bootstrap admin: created admin %s (principal_id=%s) and issued optional grants/token but failed to record the completion audit event: %w", args.username, user.PrincipalID, err))
 			return
 		}
 	}
+}
+
+func cloudBootstrapCompletionMetadata(username string, issuedToken bool, grants []cloudstore.ProjectGrant) map[string]any {
+	metadata := map[string]any{
+		"created_admin": true,
+		"username":      username,
+		"issued_token":  issuedToken,
+	}
+	if len(grants) > 0 {
+		projects := make([]string, 0, len(grants))
+		for _, grant := range grants {
+			projects = append(projects, grant.Project)
+		}
+		metadata["grant_projects"] = projects
+	}
+	return metadata
 }
 
 func recordCloudBootstrapAudit(ctx context.Context, store cloudBootstrapStore, principalID, outcome, reasonCode string, metadata map[string]any) error {
